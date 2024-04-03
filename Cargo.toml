@@ -1,0 +1,30 @@
+[package]
+name = "rdupes"
+version = "0.0.0"
+edition = "2021"
+email = "903366+erikreed@users.noreply.github.com"
+repository = "https://github.com/erikreed/rdupes"
+license = "MIT"
+description = "A rust port of pydupes. Super fast."
+
+
+[dependencies]
+kdam = "0.5.1"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4.5.4", features = ["derive"] }
+simple_logger = "4.3.3"
+log = { features = ['release_max_level_info'], version = "0.4.21" }
+futures-lite = "2.3.0"
+closure = "0.3.0"
+tokio-util = "0.7.10"
+tokio-task-tracker = "1.3.2"
+walkdir = "2.5.0"
+async-fs = "2.1.1"
+blake3 = { version = "1.5.1", features = ["mmap"] }
+itertools = "0.12.1"
+lazy_static = "1.4.0"
+mimalloc = { version = "0.1.39", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
