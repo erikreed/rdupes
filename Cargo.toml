@@ -1,6 +1,6 @@
 [package]
 name = "rdupes"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 repository = "https://github.com/erikreed/rdupes"
 license = "MIT"
@@ -11,7 +11,7 @@ description = "A rust port of pydupes. Super fast."
 kdam = "0.5.1"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5.4", features = ["derive"] }
-simple_logger = "4.3.3"
+simple_logger = { features = ['stderr'], version = "4.3.3" }
 log = { features = ['release_max_level_info'], version = "0.4.21" }
 futures-lite = "2.3.0"
 closure = "0.3.0"
