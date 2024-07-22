@@ -8,6 +8,7 @@ use async_fs::File;
 use futures::stream::FuturesUnordered;
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncReadExt, AsyncSeekExt};
+use humansize::{DECIMAL, format_size};
 use kdam::{tqdm, BarExt};
 use log::{debug, info, warn};
 use tokio::fs::symlink_metadata;
@@ -140,12 +141,18 @@ impl DupeFinder {
             eprintln!();
             info!("Files to check: {}", n);
             info!(
-                "Files to check total size: {:.3} GB",
-                size_total as f32 / 1024.0 / 1024.0 / 1024.0
+                "Files to check total size: {}",
+                format_size(size_total, DECIMAL)
             );
             info!("Files skipped: {}", n_skipped);
             info!("Hardlinks discovered: {}", n_hardlinks);
             info!("Unique sizes captured: {}", size_map.len());
+            let largest = size_map.iter()
+                .max_by_key(|(&k, v)| k * v.len() as u64);
+            if let Some(largest) = largest {
+                info!("Largest candidate set: {} files with total size {}",
+                largest.1.len(), format_size(largest.0 * largest.1.len() as u64, DECIMAL))
+            }
             size_map
         });
 
