@@ -1,3 +1,4 @@
+use std::process::exit;
 use clap::Parser;
 use log::{info, LevelFilter};
 use mimalloc::MiMalloc;
@@ -5,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use rdupes::{traverse_paths, DupeSet};
+use rdupes::{DupeSet, DupeParams, DupeFinder};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -16,7 +17,16 @@ struct Args {
     /// Paths to traverse
     paths: Vec<String>,
 
-    /// Verbose mode
+    /// Filter for files of at least the minimum size
+    #[arg(short, long, default_value_t = 8096)]
+    min_file_size: u64,
+
+    /// I/O concurrency to use for reads. For SSDs, a higher value like 128 is reasonable, while
+    /// HDDs should be very low, probably 1 if files are very large on average (multi-GB).
+    #[arg(short, long, default_value_t = 1)]
+    read_concurrency: usize,
+
+    /// Enable verbose/debug logging
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
 }
@@ -34,11 +44,20 @@ async fn main() -> std::io::Result<()> {
         .init()
         .unwrap();
 
+    info!("Parameters: {:?}", args);
+
+    assert!(args.read_concurrency > 0);
+    let params = DupeParams {
+        min_file_size: args.min_file_size,
+        read_concurrency: args.read_concurrency,
+    };
+    let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
+    let df = Box::new(DupeFinder::new(params, dupes_tx));
+
     let now = Instant::now();
     info!("Traversing paths: {:?}", args.paths);
-    let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
 
-    let task = tokio::task::spawn(traverse_paths(args.paths, dupes_tx));
+    let task = tokio::task::spawn(Box::leak(df).traverse_paths(args.paths));
     let mut stdout = tokio::io::stdout();
     while let Some(mut ds) = dupes_rx.recv().await {
         ds.paths.sort();
@@ -50,8 +69,8 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    task.await??;
     info!("Elapsed time: {:.1}s", now.elapsed().as_secs_f32());
+    task.await??;
 
-    Ok(())
+    exit(0);
 }

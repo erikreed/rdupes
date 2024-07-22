@@ -700,7 +700,6 @@ dependencies = [
  "futures",
  "futures-lite",
  "kdam",
- "lazy_static",
  "log",
  "mimalloc",
  "simple_logger",
