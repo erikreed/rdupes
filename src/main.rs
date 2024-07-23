@@ -1,4 +1,3 @@
-use std::process::exit;
 use clap::Parser;
 use log::{info, LevelFilter};
 use mimalloc::MiMalloc;
@@ -6,7 +5,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use rdupes::{DupeSet, DupeParams, DupeFinder};
+use rdupes::{DupeFinder, DupeParams, DupeSet};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -18,12 +17,12 @@ struct Args {
     paths: Vec<String>,
 
     /// Filter for files of at least the minimum size
-    #[arg(short, long, default_value_t = 8096)]
+    #[arg(short, long, default_value_t = 8192)]
     min_file_size: u64,
 
     /// I/O concurrency to use for reads. For SSDs, a higher value like 128 is reasonable, while
     /// HDDs should be very low, probably 1 if files are very large on average (multi-GB).
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(short, long, default_value_t = 4)]
     read_concurrency: usize,
 
     /// Enable verbose/debug logging
@@ -52,14 +51,15 @@ async fn main() -> std::io::Result<()> {
         read_concurrency: args.read_concurrency,
     };
     let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
-    let df = Box::new(DupeFinder::new(params, dupes_tx));
+    let df = Box::new(DupeFinder::new(params));
 
     let now = Instant::now();
     info!("Traversing paths: {:?}", args.paths);
 
-    let task = tokio::task::spawn(Box::leak(df).traverse_paths(args.paths));
+    let task = tokio::task::spawn(Box::leak(df).traverse_paths(args.paths, dupes_tx));
     let mut stdout = tokio::io::stdout();
     while let Some(mut ds) = dupes_rx.recv().await {
+        // TODO: custom sorter
         ds.paths.sort();
         let source = &ds.paths[0];
         for dest in &ds.paths[1..] {
@@ -69,8 +69,8 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    info!("Elapsed time: {:.1}s", now.elapsed().as_secs_f32());
     task.await??;
+    info!("Elapsed time: {:.1}s", now.elapsed().as_secs_f32());
 
-    exit(0);
+    Ok(())
 }

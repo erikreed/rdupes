@@ -8,16 +8,16 @@ use async_fs::File;
 use futures::stream::FuturesUnordered;
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncReadExt, AsyncSeekExt};
-use humansize::{DECIMAL, format_size};
+use humansize::{BINARY, format_size};
 use kdam::{tqdm, BarExt};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use tokio::fs::symlink_metadata;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::Instant;
 use walkdir::WalkDir;
 
-const EDGE_SIZE: usize = 8096;
+const EDGE_SIZE: usize = 8192;
 
 type Hash = [u8; 32];
 
@@ -33,23 +33,20 @@ pub struct DupeSet {
 
 pub struct DupeFinder {
     min_file_size: u64,
-    task_semaphore: Semaphore,
     read_semaphore: Semaphore,
-
     dupe_files: AtomicU64,
     dupe_sizes: AtomicU64,
-    dupes_tx: Sender<DupeSet>,
+    read_concurrency: usize,
 }
 
 impl DupeFinder {
-    pub fn new(params: DupeParams, dupes_tx: Sender<DupeSet>) -> Self {
+    pub fn new(params: DupeParams) -> Self {
         Self {
             min_file_size: params.min_file_size,
-            task_semaphore: Semaphore::new(16),
             read_semaphore: Semaphore::new(params.read_concurrency),
+            read_concurrency: params.read_concurrency,
             dupe_files: AtomicU64::default(),
             dupe_sizes: AtomicU64::default(),
-            dupes_tx,
         }
     }
 
@@ -84,11 +81,14 @@ impl DupeFinder {
             .into_iter()
             .map(|p| {
                 tokio::spawn(async move {
-                    let _permit = self.read_semaphore.acquire().await.unwrap();
+                    let _permit = &self.read_semaphore.acquire().await.unwrap();
                     let hash = match mode {
                         PathCheckMode::Start => self.hash_file_chunk(&p, true, fsize).await,
                         PathCheckMode::End => self.hash_file_chunk(&p, false, fsize).await,
-                        PathCheckMode::Full => hash_file(&p),
+                        PathCheckMode::Full => {
+                            let p = p.clone();
+                            tokio::task::spawn_blocking(move || hash_file(&p)).await.unwrap()
+                        },
                     };
                     (p, hash)
                 })
@@ -117,7 +117,7 @@ impl DupeFinder {
             let mut inodes = HashSet::<u64>::new();
             let mut size_map = HashMap::<u64, Vec<String>>::new();
             let mut n = 0u64;
-            let mut n_skipped = 0u64;
+            let mut n_filtered = 0u64;
             let mut n_hardlinks = 0u64;
             let mut size_total = 0u64;
 
@@ -127,31 +127,34 @@ impl DupeFinder {
 
                 let new_inode = inodes.insert(metadata.st_ino());
 
-                if metadata.len() > self.min_file_size && new_inode {
-                    n += 1;
-                    size_total += metadata.len();
-                    size_map.entry(metadata.len()).or_default().push(path);
+                if new_inode {
+                    if metadata.len() >= self.min_file_size {
+                        n += 1;
+                        size_total += metadata.len();
+                        size_map.entry(metadata.len()).or_default().push(path);
+                    } else {
+                        n_filtered += 1;
+                    }
                 } else {
-                    n_skipped += 1;
-                }
-                if !new_inode {
                     n_hardlinks += 1;
                 }
             }
-            eprintln!();
+            drop(pbar);
+            size_map.retain(|_, v| v.len() > 1);
+
             info!("Files to check: {}", n);
             info!(
                 "Files to check total size: {}",
-                format_size(size_total, DECIMAL)
+                format_size(size_total, BINARY)
             );
-            info!("Files skipped: {}", n_skipped);
-            info!("Hardlinks discovered: {}", n_hardlinks);
+            info!("Files size-filtered: {}", n_filtered);
+            info!("Hardlinks discovered/skipped: {}", n_hardlinks);
             info!("Unique sizes captured: {}", size_map.len());
             let largest = size_map.iter()
                 .max_by_key(|(&k, v)| k * v.len() as u64);
             if let Some(largest) = largest {
                 info!("Largest candidate set: {} files with total size {}",
-                largest.1.len(), format_size(largest.0 * largest.1.len() as u64, DECIMAL))
+                largest.1.len(), format_size(largest.0 * largest.1.len() as u64, BINARY))
             }
             size_map
         });
@@ -160,12 +163,14 @@ impl DupeFinder {
         let errors = Arc::new(AtomicU64::new(0));
 
         let (spawner, waiter) = tokio_task_tracker::new();
+
+        // TODO: multiple filesystems not supported; hardlink detection will fail
         for entry in chain_dirs(args) {
             let tx = tx.clone();
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    info!("Failed to traverse directory. {}", e);
+                    error!("Failed to traverse path. {}", e);
                     continue;
                 }
             };
@@ -179,7 +184,7 @@ impl DupeFinder {
                 match symlink_metadata(entry.path()).await {
                     Ok(metadata) => {
                         if metadata.is_file() {
-                            tx.send((entry.path().to_str().unwrap().to_string(), metadata))
+                            tx.send((entry.path().to_string_lossy().to_string(), metadata))
                                 .await
                                 .unwrap();
                         } else {
@@ -208,7 +213,7 @@ impl DupeFinder {
         Ok(size_map)
     }
 
-    pub async fn traverse_paths(&'static self, paths: Vec<String>) -> std::io::Result<()> {
+    pub async fn traverse_paths(&'static self, paths: Vec<String>, dupes_tx: Sender<DupeSet>) -> std::io::Result<()> {
         let now = Instant::now();
         let size_map = self.traverse(paths).await?;
         info!(
@@ -221,14 +226,15 @@ impl DupeFinder {
             total = size_map.len(),
             desc = "Computing hashes"
         )));
+        let task_semaphore = Arc::new(Semaphore::new(self.read_concurrency.max(4)));
 
         // TODO: remove redundant hash check for smaller file sizes: skip front/back checks
         for (fsize, paths) in size_map.into_iter() {
             let pbar = pbar.clone();
-
+            let dupes_tx = dupes_tx.clone();
+            let permit = task_semaphore.clone().acquire_owned();
             spawner.spawn(|tracker| async move {
                 let _tracker = tracker;
-                let _permit = self.task_semaphore.acquire().await.unwrap();
 
                 let candidates = self.dedupe_paths(fsize, paths, PathCheckMode::Start).await;
 
@@ -248,7 +254,7 @@ impl DupeFinder {
                                             (dupes.len() - 1) as u64 * fsize,
                                             Ordering::Relaxed,
                                         );
-                                        self.dupes_tx
+                                        dupes_tx
                                             .send(DupeSet {
                                                 fsize,
                                                 paths: dupes,
@@ -262,13 +268,14 @@ impl DupeFinder {
                     }
                 }
                 pbar.lock().await.update(1).unwrap();
+                drop(permit);  // move permit into the tokio thread
             });
         }
         waiter.wait().await;
         info!("Dupes found: {:?}", self.dupe_files.load(Ordering::Relaxed));
         info!(
-            "Dupes total size: {:.3} GB",
-            self.dupe_sizes.load(Ordering::Relaxed) as f32 / 1024.0 / 1024.0 / 1024.0
+            "Dupes total size: {} (redundant data)",
+            format_size(self.dupe_sizes.load(Ordering::Relaxed), BINARY)
         );
         Ok(())
     }
@@ -289,7 +296,8 @@ fn chain_dirs(
         WalkDir::new(s)
             .follow_root_links(true)
             .follow_links(false)
-            .max_open(1024)
+            .same_file_system(true)
+            .max_open(65536)
     })
 }
 
