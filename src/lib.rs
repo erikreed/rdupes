@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::SeekFrom;
+use std::io::{Read, SeekFrom};
 use std::os::linux::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use async_fs::File;
 use futures::stream::FuturesUnordered;
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncReadExt, AsyncSeekExt};
-use humansize::{BINARY, format_size};
+use humansize::{format_size, BINARY};
 use kdam::{tqdm, BarExt};
 use log::{debug, error, info, warn};
 use tokio::fs::symlink_metadata;
@@ -24,6 +24,7 @@ type Hash = [u8; 32];
 pub struct DupeParams {
     pub min_file_size: u64,
     pub read_concurrency: usize,
+    pub disable_mmap: bool,
 }
 
 pub struct DupeSet {
@@ -37,6 +38,7 @@ pub struct DupeFinder {
     dupe_files: AtomicU64,
     dupe_sizes: AtomicU64,
     read_concurrency: usize,
+    disable_mmap: bool,
 }
 
 impl DupeFinder {
@@ -47,6 +49,7 @@ impl DupeFinder {
             read_concurrency: params.read_concurrency,
             dupe_files: AtomicU64::default(),
             dupe_sizes: AtomicU64::default(),
+            disable_mmap: params.disable_mmap,
         }
     }
 
@@ -87,8 +90,16 @@ impl DupeFinder {
                         PathCheckMode::End => self.hash_file_chunk(&p, false, fsize).await,
                         PathCheckMode::Full => {
                             let p = p.clone();
-                            tokio::task::spawn_blocking(move || hash_file(&p)).await.unwrap()
-                        },
+                            tokio::task::spawn_blocking(move || {
+                                if self.disable_mmap {
+                                    hash_file(&p)
+                                } else {
+                                    hash_mmap_file(&p)
+                                }
+                            })
+                            .await
+                            .unwrap()
+                        }
                     };
                     (p, hash)
                 })
@@ -150,11 +161,13 @@ impl DupeFinder {
             info!("Files size-filtered: {}", n_filtered);
             info!("Hardlinks discovered/skipped: {}", n_hardlinks);
             info!("Unique sizes captured: {}", size_map.len());
-            let largest = size_map.iter()
-                .max_by_key(|(&k, v)| k * v.len() as u64);
+            let largest = size_map.iter().max_by_key(|(&k, v)| k * v.len() as u64);
             if let Some(largest) = largest {
-                info!("Largest candidate set: {} files with total size {}",
-                largest.1.len(), format_size(largest.0 * largest.1.len() as u64, BINARY))
+                info!(
+                    "Largest candidate set: {} files with total size {}",
+                    largest.1.len(),
+                    format_size(largest.0 * largest.1.len() as u64, BINARY)
+                )
             }
             size_map
         });
@@ -213,7 +226,11 @@ impl DupeFinder {
         Ok(size_map)
     }
 
-    pub async fn traverse_paths(&'static self, paths: Vec<String>, dupes_tx: Sender<DupeSet>) -> std::io::Result<()> {
+    pub async fn traverse_paths(
+        &'static self,
+        paths: Vec<String>,
+        dupes_tx: Sender<DupeSet>,
+    ) -> std::io::Result<()> {
         let now = Instant::now();
         let size_map = self.traverse(paths).await?;
         info!(
@@ -268,7 +285,7 @@ impl DupeFinder {
                     }
                 }
                 pbar.lock().await.update(1).unwrap();
-                drop(permit);  // move permit into the tokio thread
+                drop(permit); // move permit into the tokio thread
             });
         }
         waiter.wait().await;
@@ -281,10 +298,28 @@ impl DupeFinder {
     }
 }
 
-fn hash_file(path: &str) -> std::io::Result<Hash> {
+fn hash_mmap_file(path: &str) -> std::io::Result<Hash> {
     let path = path.to_owned();
     let mut hasher = blake3::Hasher::new();
     hasher.update_mmap(path)?;
+    let hash = hasher.finalize();
+    Ok(*hash.as_bytes())
+}
+
+fn hash_file(path: &str) -> std::io::Result<Hash> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0; 65536];
+
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..n]);
+    }
+
     let hash = hasher.finalize();
     Ok(*hash.as_bytes())
 }

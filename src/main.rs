@@ -25,6 +25,11 @@ struct Args {
     #[arg(short, long, default_value_t = 4)]
     read_concurrency: usize,
 
+    /// Disable memory-mapped I/O for full file hashing. This helps memory benchmarking but may
+    /// reduce hash speed for files already in the OS cache.
+    #[arg(short, long, default_value_t = false)]
+    disable_mmap: bool,
+
     /// Enable verbose/debug logging
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
@@ -49,6 +54,7 @@ async fn main() -> std::io::Result<()> {
     let params = DupeParams {
         min_file_size: args.min_file_size,
         read_concurrency: args.read_concurrency,
+        disable_mmap: args.disable_mmap,
     };
     let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
     let df = Box::new(DupeFinder::new(params));
