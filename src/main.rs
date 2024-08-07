@@ -1,5 +1,9 @@
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::PathBuf;
+
 use clap::Parser;
-use log::{info, LevelFilter};
+use log::{error, info, LevelFilter};
 use mimalloc::MiMalloc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -9,12 +13,21 @@ use rdupes::{DupeFinder, DupeParams, DupeSet};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
 /// A duplicate file finder.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Paths to traverse
     paths: Vec<String>,
+
+    /// Save a traversal checkpoint at the path if provided.
+    #[arg(short = 's', long)]
+    checkpoint_save_path: Option<PathBuf>,
+
+    /// Load a traversal checkpoint at the path if provided. The input paths are ignored if so.
+    #[arg(short = 'l', long)]
+    checkpoint_load_path: Option<PathBuf>,
 
     /// Filter for files of at least the minimum size
     #[arg(short, long, default_value_t = 8192)]
@@ -57,12 +70,31 @@ async fn main() -> std::io::Result<()> {
         disable_mmap: args.disable_mmap,
     };
     let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
-    let df = Box::new(DupeFinder::new(params));
+    let df = Box::leak(Box::new(DupeFinder::new(params)));
 
     let now = Instant::now();
-    info!("Traversing paths: {:?}", args.paths);
 
-    let task = tokio::task::spawn(Box::leak(df).traverse_paths(args.paths, dupes_tx));
+    let size_map = {
+        if let Some(path) = args.checkpoint_load_path {
+            info!("Reading checkpoint from: {path:?}");
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            ciborium::from_reader(reader).expect("Failed to parse checkpoint data")
+        } else {
+            info!("Traversing paths: {:?}", args.paths);
+            df.traverse_paths(args.paths).await?
+        }
+    };
+
+    if let Some(path) = args.checkpoint_save_path {
+        info!("Saving checkpoint to: {path:?}");
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        let _ = ciborium::into_writer(&size_map, writer)
+            .map_err(|e| error!("Failed to save checkpoint data: {e:?}"));
+    }
+
+    let task = tokio::task::spawn(df.check_hashes_and_content(size_map, dupes_tx));
     let mut stdout = tokio::io::stdout();
     while let Some(mut ds) = dupes_rx.recv().await {
         // TODO: custom sorter

@@ -1,20 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, SeekFrom};
 #[cfg(unix)]
 use std::os::linux::fs::MetadataExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_fs::File;
 use futures::stream::FuturesUnordered;
-use futures_lite::{AsyncReadExt, AsyncSeekExt};
 use futures_lite::io::BufReader;
-use humansize::{BINARY, format_size};
-use kdam::{BarExt, tqdm};
+use futures_lite::{AsyncReadExt, AsyncSeekExt};
+use humansize::{format_size, BINARY};
+use kdam::{tqdm, BarExt};
 use log::{debug, error, info, warn};
 use tokio::fs::symlink_metadata;
-use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::Instant;
 use walkdir::WalkDir;
 
@@ -98,8 +98,8 @@ impl DupeFinder {
                                     hash_mmap_file(&p)
                                 }
                             })
-                                .await
-                                .unwrap()
+                            .await
+                            .unwrap()
                         }
                     };
                     (p, hash)
@@ -119,10 +119,11 @@ impl DupeFinder {
         candidates
     }
 
-    pub async fn traverse(
+    pub async fn traverse_paths(
         &'static self,
-        args: Vec<String>,
+        paths: Vec<String>,
     ) -> Result<HashMap<u64, Vec<String>>, std::io::Error> {
+        let now = Instant::now();
         let (tx, mut rx) = mpsc::channel::<(String, std::fs::Metadata)>(1024);
 
         let handle = tokio::spawn(async move {
@@ -142,7 +143,7 @@ impl DupeFinder {
                 #[cfg(unix)]
                 let new_inode = inodes.insert(metadata.st_ino());
                 #[cfg(not(unix))]
-                let new_inode = false;
+                let new_inode = true;
 
                 if new_inode {
                     if metadata.len() >= self.min_file_size {
@@ -184,7 +185,7 @@ impl DupeFinder {
         let (spawner, waiter) = tokio_task_tracker::new();
 
         // TODO: multiple filesystems not supported; hardlink detection will fail
-        for entry in chain_dirs(args) {
+        for entry in chain_dirs(paths) {
             let tx = tx.clone();
             let entry = match entry {
                 Ok(entry) => entry,
@@ -229,21 +230,19 @@ impl DupeFinder {
         info!("Errors during traversal: {:?}", errors);
 
         let size_map = handle.await?;
-        Ok(size_map)
-    }
-
-    pub async fn traverse_paths(
-        &'static self,
-        paths: Vec<String>,
-        dupes_tx: Sender<DupeSet>,
-    ) -> std::io::Result<()> {
-        let now = Instant::now();
-        let size_map = self.traverse(paths).await?;
         info!(
             "Traversal completed in: {:.1}s",
             now.elapsed().as_secs_f32()
         );
 
+        Ok(size_map)
+    }
+
+    pub async fn check_hashes_and_content(
+        &'static self,
+        size_map: HashMap<u64, Vec<String>>,
+        dupes_tx: Sender<DupeSet>,
+    ) -> std::io::Result<()> {
         let (spawner, waiter) = tokio_task_tracker::new();
         let pbar = Arc::new(Mutex::new(tqdm!(
             total = size_map.len(),
@@ -332,7 +331,7 @@ fn hash_file(path: &str) -> std::io::Result<Hash> {
 
 fn chain_dirs(
     dirs: Vec<String>,
-) -> impl Iterator<Item=Result<walkdir::DirEntry, walkdir::Error>> {
+) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> {
     dirs.into_iter().flat_map(|s| {
         WalkDir::new(s)
             .follow_root_links(true)
