@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, SeekFrom};
+#[cfg(unix)]
 use std::os::linux::fs::MetadataExt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_fs::File;
 use futures::stream::FuturesUnordered;
-use futures_lite::io::BufReader;
 use futures_lite::{AsyncReadExt, AsyncSeekExt};
-use humansize::{format_size, BINARY};
-use kdam::{tqdm, BarExt};
+use futures_lite::io::BufReader;
+use humansize::{BINARY, format_size};
+use kdam::{BarExt, tqdm};
 use log::{debug, error, info, warn};
 use tokio::fs::symlink_metadata;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::mpsc::Sender;
 use tokio::time::Instant;
 use walkdir::WalkDir;
 
@@ -97,8 +98,8 @@ impl DupeFinder {
                                     hash_mmap_file(&p)
                                 }
                             })
-                            .await
-                            .unwrap()
+                                .await
+                                .unwrap()
                         }
                     };
                     (p, hash)
@@ -125,7 +126,9 @@ impl DupeFinder {
         let (tx, mut rx) = mpsc::channel::<(String, std::fs::Metadata)>(1024);
 
         let handle = tokio::spawn(async move {
+            #[cfg(unix)]
             let mut inodes = HashSet::<u64>::new();
+
             let mut size_map = HashMap::<u64, Vec<String>>::new();
             let mut n = 0u64;
             let mut n_filtered = 0u64;
@@ -136,7 +139,10 @@ impl DupeFinder {
             while let Some((path, metadata)) = rx.recv().await {
                 pbar.update(1).unwrap();
 
+                #[cfg(unix)]
                 let new_inode = inodes.insert(metadata.st_ino());
+                #[cfg(not(unix))]
+                let new_inode = false;
 
                 if new_inode {
                     if metadata.len() >= self.min_file_size {
@@ -326,7 +332,7 @@ fn hash_file(path: &str) -> std::io::Result<Hash> {
 
 fn chain_dirs(
     dirs: Vec<String>,
-) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> {
+) -> impl Iterator<Item=Result<walkdir::DirEntry, walkdir::Error>> {
     dirs.into_iter().flat_map(|s| {
         WalkDir::new(s)
             .follow_root_links(true)
