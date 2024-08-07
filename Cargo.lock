@@ -729,7 +729,6 @@ dependencies = [
  "kdam",
  "log",
  "mimalloc",
- "serde",
  "simple_logger",
  "tokio",
  "tokio-task-tracker",
