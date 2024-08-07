@@ -10,7 +10,7 @@ use futures::stream::FuturesUnordered;
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncReadExt, AsyncSeekExt};
 use humansize::{format_size, BINARY};
-use kdam::{tqdm, BarExt};
+use kdam::{tqdm, Bar, BarExt};
 use log::{debug, error, info, warn};
 use tokio::fs::symlink_metadata;
 use tokio::sync::mpsc::Sender;
@@ -21,6 +21,7 @@ use walkdir::WalkDir;
 const EDGE_SIZE: usize = 8192;
 
 type Hash = [u8; 32];
+type SizeMap = HashMap<u64, Vec<String>>;
 
 pub struct DupeParams {
     pub min_file_size: u64,
@@ -40,6 +41,38 @@ pub struct DupeFinder {
     dupe_sizes: AtomicU64,
     read_concurrency: usize,
     disable_mmap: bool,
+}
+
+struct DupeProgress {
+    pbar_count: Bar,
+    pbar_size: Bar,
+}
+
+impl DupeProgress {
+    fn new(size_map: &SizeMap) -> Self {
+        let pbar_count = tqdm!(
+            total = size_map.len(),
+            desc = "Computing hashes",
+            unit = " file",
+            position = 0
+        );
+        let pbar_size = tqdm!(
+            total = size_map.keys().sum::<u64>() as usize,
+            desc = "Computing hashes",
+            position = 1,
+            unit = "B",
+            unit_scale = true
+        );
+        Self {
+            pbar_count,
+            pbar_size,
+        }
+    }
+
+    fn update(&mut self, size: usize) {
+        self.pbar_count.update(1).unwrap();
+        self.pbar_size.update(size).unwrap();
+    }
 }
 
 impl DupeFinder {
@@ -122,7 +155,7 @@ impl DupeFinder {
     pub async fn traverse_paths(
         &'static self,
         paths: Vec<String>,
-    ) -> Result<HashMap<u64, Vec<String>>, std::io::Error> {
+    ) -> Result<SizeMap, std::io::Error> {
         let now = Instant::now();
         let (tx, mut rx) = mpsc::channel::<(String, std::fs::Metadata)>(1024);
 
@@ -136,9 +169,16 @@ impl DupeFinder {
             let mut n_hardlinks = 0u64;
             let mut size_total = 0u64;
 
-            let mut pbar = tqdm!(desc = "Traversing files");
+            let mut file_pbar = tqdm!(desc = "Traversing files", position = 0, unit = " file");
+            let mut size_pbar = tqdm!(
+                desc = "Traversing files",
+                position = 1,
+                unit = "B",
+                unit_scale = true
+            );
             while let Some((path, metadata)) = rx.recv().await {
-                pbar.update(1).unwrap();
+                file_pbar.update(1).unwrap();
+                size_pbar.update(metadata.len() as usize).unwrap();
 
                 #[cfg(unix)]
                 let new_inode = inodes.insert(metadata.st_ino());
@@ -157,7 +197,8 @@ impl DupeFinder {
                     n_hardlinks += 1;
                 }
             }
-            drop(pbar);
+            drop(file_pbar);
+            drop(size_pbar);
             size_map.retain(|_, v| v.len() > 1);
 
             info!("Files to check: {}", n);
@@ -240,14 +281,11 @@ impl DupeFinder {
 
     pub async fn check_hashes_and_content(
         &'static self,
-        size_map: HashMap<u64, Vec<String>>,
+        size_map: SizeMap,
         dupes_tx: Sender<DupeSet>,
     ) -> std::io::Result<()> {
         let (spawner, waiter) = tokio_task_tracker::new();
-        let pbar = Arc::new(Mutex::new(tqdm!(
-            total = size_map.len(),
-            desc = "Computing hashes"
-        )));
+        let pbar = Arc::new(Mutex::new(DupeProgress::new(&size_map)));
         let task_semaphore = Arc::new(Semaphore::new(self.read_concurrency.max(4)));
 
         // TODO: remove redundant hash check for smaller file sizes: skip front/back checks
@@ -289,11 +327,12 @@ impl DupeFinder {
                         }
                     }
                 }
-                pbar.lock().await.update(1).unwrap();
+                pbar.lock().await.update(fsize as usize);
                 drop(permit); // move permit into the tokio thread
             });
         }
         waiter.wait().await;
+        drop(pbar);
         info!("Dupes found: {:?}", self.dupe_files.load(Ordering::Relaxed));
         info!(
             "Dupes total size: {} (redundant data)",
