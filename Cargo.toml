@@ -1,6 +1,6 @@
 [package]
 name = "rdupes"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/erikreed/rdupes"
 license = "MIT"
@@ -21,7 +21,7 @@ log = { features = ['release_max_level_info'], version = "0.4" }
 mimalloc = { version = "0.1", default-features = false }
 simple_logger = { features = ['stderr'], version = "4.3" }
 tokio = { version = "1", features = ["full"] }
-tokio-task-tracker = {git = "https://github.com/erikreed/rust-tokio-task-tracker"}
+tokio-task-tracker = "1.3"
 tokio-util = "0.7"
 walkdir = "2.5"
 
