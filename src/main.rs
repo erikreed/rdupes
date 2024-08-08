@@ -82,7 +82,7 @@ async fn main() -> std::io::Result<()> {
             ciborium::from_reader(reader).expect("Failed to parse checkpoint data")
         } else {
             info!("Traversing paths: {:?}", args.paths);
-            df.traverse_paths(args.paths).await?
+            df.traverse_paths(args.paths.clone()).await?
         }
     };
 
@@ -97,8 +97,7 @@ async fn main() -> std::io::Result<()> {
     let task = tokio::task::spawn(df.check_hashes_and_content(size_map, dupes_tx));
     let mut stdout = tokio::io::stdout();
     while let Some(mut ds) = dupes_rx.recv().await {
-        // TODO: custom sorter
-        ds.paths.sort();
+        ds.sort_paths(&args.paths);
         let source = &ds.paths[0];
         for dest in &ds.paths[1..] {
             stdout

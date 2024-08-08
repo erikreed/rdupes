@@ -1,3 +1,6 @@
+#[cfg(not(unix))]
+use std::collections::HashMap;
+#[cfg(unix)]
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, SeekFrom};
 #[cfg(unix)]
@@ -32,6 +35,31 @@ pub struct DupeParams {
 pub struct DupeSet {
     pub paths: Vec<String>,
     pub fsize: u64,
+}
+
+impl DupeSet {
+    pub fn sort_paths(&mut self, input_paths: &[String]) {
+        fn lmatch_count(left: &str, right: &str) -> usize {
+            let mut i = 0;
+            for (a, b) in left.bytes().zip(right.bytes()) {
+                if a == b {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            i
+        }
+
+        self.paths.sort_by_cached_key(|p| {
+            input_paths
+                .iter()
+                .enumerate()
+                .max_by_key(|(_i, s)| lmatch_count(s, p))
+                .map(|(i, _s)| (i, p.len()))
+                .unwrap_or((usize::MAX, usize::MAX))
+        });
+    }
 }
 
 pub struct DupeFinder {
@@ -385,4 +413,41 @@ pub enum PathCheckMode {
     Start,
     End,
     Full,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sorting() {
+        let input_paths = vec!["/asd/".into(), "/def/".into(), "/tmp/asd/".into()];
+        let mut ds = DupeSet {
+            paths: vec![
+                "/asd/file1000.txt".to_string(),
+                "/def/z".to_string(),
+                "/tmp/asd/f123.mp4".to_string(),
+                "/def/yyy".to_string(),
+                "/def/xx".to_string(),
+                "/asd/file1.txt".to_string(),
+                "/def/1234".to_string(),
+                "/asd/xile100.txt".to_string(),
+            ],
+            fsize: 0,
+        };
+        ds.sort_paths(&input_paths);
+        assert_eq!(
+            vec![
+                "/asd/file1.txt".to_string(),
+                "/asd/xile100.txt".to_string(),
+                "/asd/file1000.txt".to_string(),
+                "/def/z".to_string(),
+                "/def/xx".to_string(),
+                "/def/yyy".to_string(),
+                "/def/1234".to_string(),
+                "/tmp/asd/f123.mp4".to_string(),
+            ],
+            ds.paths
+        )
+    }
 }
