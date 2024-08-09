@@ -1,15 +1,12 @@
-use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
 
 use clap::Parser;
 use log::{error, info, LevelFilter};
 use mimalloc::MiMalloc;
-use tokio::io::AsyncWriteExt;
+use rdupes::{DupeFinder, DupeParams, DupeSet};
+use std::io::Write;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-
-use rdupes::{DupeFinder, DupeParams, DupeSet};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -21,16 +18,20 @@ struct Args {
     /// Paths to traverse
     paths: Vec<String>,
 
-    /// Save a traversal checkpoint at the path if provided.
-    #[arg(short = 's', long)]
-    checkpoint_save_path: Option<PathBuf>,
+    /// Save null delimited source-dupe pairs to the output path. Use '-' for stdout.
+    #[arg(short, long)]
+    output_path: Option<clio::OutputPath>,
 
-    /// Load a traversal checkpoint at the path if provided. The input paths are ignored if so.
+    /// Save a traversal checkpoint at the path if provided. Use '-' for stdout.
+    #[arg(short = 's', long)]
+    checkpoint_save_path: Option<clio::OutputPath>,
+
+    /// Load a traversal checkpoint at the path if provided.
     #[arg(short = 'l', long)]
-    checkpoint_load_path: Option<PathBuf>,
+    checkpoint_load_path: Option<clio::Input>,
 
     /// Filter for files of at least the minimum size
-    #[arg(short, long, default_value_t = 8192)]
+    #[arg(short, long, default_value_t = 4096)]
     min_file_size: u64,
 
     /// I/O concurrency to use for reads. For SSDs, a higher value like 128 is reasonable, while
@@ -75,10 +76,9 @@ async fn main() -> std::io::Result<()> {
     let now = Instant::now();
 
     let size_map = {
-        if let Some(path) = args.checkpoint_load_path {
-            info!("Reading checkpoint from: {path:?}");
-            let file = File::open(path)?;
-            let reader = BufReader::new(file);
+        if let Some(f) = args.checkpoint_load_path {
+            info!("Reading checkpoint from: {:?}", f.path());
+            let reader = BufReader::new(f);
             ciborium::from_reader(reader).expect("Failed to parse checkpoint data")
         } else {
             info!("Traversing paths: {:?}", args.paths);
@@ -88,21 +88,23 @@ async fn main() -> std::io::Result<()> {
 
     if let Some(path) = args.checkpoint_save_path {
         info!("Saving checkpoint to: {path:?}");
-        let file = File::create(path)?;
+        let file = path.create()?;
         let writer = BufWriter::new(file);
         let _ = ciborium::into_writer(&size_map, writer)
             .map_err(|e| error!("Failed to save checkpoint data: {e:?}"));
     }
 
     let task = tokio::task::spawn(df.check_hashes_and_content(size_map, dupes_tx));
-    let mut stdout = tokio::io::stdout();
+    let mut out = args
+        .output_path
+        .map(|f| f.create().expect("Unable to open output file"));
     while let Some(mut ds) = dupes_rx.recv().await {
-        ds.sort_paths(&args.paths);
-        let source = &ds.paths[0];
-        for dest in &ds.paths[1..] {
-            stdout
-                .write_all(format!("{source}\0{dest}\0").as_ref())
-                .await?;
+        if let Some(ref mut f) = out {
+            ds.sort_paths(&args.paths);
+            let source = &ds.paths[0];
+            for dest in &ds.paths[1..] {
+                f.write_all(format!("{source}\0{dest}\0").as_ref())?;
+            }
         }
     }
 

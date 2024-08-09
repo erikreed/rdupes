@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::Instant;
 use walkdir::WalkDir;
 
-const EDGE_SIZE: usize = 8192;
+const EDGE_SIZE: usize = 4096;
 
 type Hash = [u8; 32];
 type SizeMap = HashMap<u64, Vec<String>>;
@@ -40,15 +40,12 @@ pub struct DupeSet {
 impl DupeSet {
     pub fn sort_paths(&mut self, input_paths: &[String]) {
         fn lmatch_count(left: &str, right: &str) -> usize {
-            let mut i = 0;
-            for (a, b) in left.bytes().zip(right.bytes()) {
-                if a == b {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            i
+            left.bytes()
+                .zip(right.bytes())
+                .enumerate()
+                .find(|(_i, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .unwrap_or(left.len().min(right.len()))
         }
 
         self.paths.sort_by_cached_key(|p| {
@@ -253,7 +250,6 @@ impl DupeFinder {
 
         let (spawner, waiter) = tokio_task_tracker::new();
 
-        // TODO: multiple filesystems not supported; hardlink detection will fail
         for entry in chain_dirs(paths) {
             let tx = tx.clone();
             let entry = match entry {
