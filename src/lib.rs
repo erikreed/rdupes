@@ -15,6 +15,7 @@ use futures_lite::{AsyncReadExt, AsyncSeekExt};
 use humansize::{format_size, BINARY};
 use kdam::{tqdm, Bar, BarExt};
 use log::{debug, error, info, warn};
+use tinyvec::TinyVec;
 use tokio::fs::symlink_metadata;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -24,7 +25,8 @@ use walkdir::WalkDir;
 const EDGE_SIZE: usize = 4096;
 
 type Hash = [u8; 32];
-type SizeMap = HashMap<u64, Vec<String>>;
+type TVString = TinyVec<[String; 4]>;
+type SizeMap = HashMap<u64, TVString>;
 
 pub struct DupeParams {
     pub min_file_size: u64,
@@ -134,10 +136,10 @@ impl DupeFinder {
     pub async fn dedupe_paths(
         &'static self,
         fsize: u64,
-        paths: Vec<String>,
+        paths: TVString,
         mode: PathCheckMode,
-    ) -> HashMap<Hash, Vec<String>> {
-        let mut candidates: HashMap<Hash, Vec<String>> = HashMap::with_capacity(paths.len());
+    ) -> HashMap<Hash, TVString> {
+        let mut candidates: HashMap<Hash, TVString> = HashMap::with_capacity(paths.len());
 
         for task in paths
             .into_iter()
@@ -188,7 +190,7 @@ impl DupeFinder {
             #[cfg(unix)]
             let mut inodes = HashSet::<u64>::new();
 
-            let mut size_map = HashMap::<u64, Vec<String>>::new();
+            let mut size_map = SizeMap::new();
             let mut n = 0u64;
             let mut n_filtered = 0u64;
             let mut n_hardlinks = 0u64;
@@ -341,7 +343,7 @@ impl DupeFinder {
                                         dupes_tx
                                             .send(DupeSet {
                                                 fsize,
-                                                paths: dupes,
+                                                paths: dupes.into_iter().collect(),
                                             })
                                             .await
                                             .expect("Failed to send to dupes_tx");
