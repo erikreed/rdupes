@@ -61,11 +61,12 @@ impl DupeSet {
     }
 }
 
+#[derive(Clone)]
 pub struct DupeFinder {
     min_file_size: u64,
-    read_semaphore: Semaphore,
-    dupe_files: AtomicU64,
-    dupe_sizes: AtomicU64,
+    read_semaphore: Arc<Semaphore>,
+    dupe_files: Arc<AtomicU64>,
+    dupe_sizes: Arc<AtomicU64>,
     read_concurrency: usize,
     disable_mmap: bool,
 }
@@ -106,10 +107,10 @@ impl DupeFinder {
     pub fn new(params: DupeParams) -> Self {
         Self {
             min_file_size: params.min_file_size,
-            read_semaphore: Semaphore::new(params.read_concurrency),
+            read_semaphore: Arc::new(Semaphore::new(params.read_concurrency)),
             read_concurrency: params.read_concurrency,
-            dupe_files: AtomicU64::default(),
-            dupe_sizes: AtomicU64::default(),
+            dupe_files: Arc::default(),
+            dupe_sizes: Arc::default(),
             disable_mmap: params.disable_mmap,
         }
     }
@@ -134,7 +135,7 @@ impl DupeFinder {
     }
 
     pub async fn dedupe_paths(
-        &'static self,
+        &self,
         fsize: u64,
         paths: TVString,
         mode: PathCheckMode,
@@ -144,22 +145,23 @@ impl DupeFinder {
         for task in paths
             .into_iter()
             .map(|p| {
+                let df = self.clone();
                 tokio::spawn(async move {
-                    let _permit = &self.read_semaphore.acquire().await.unwrap();
+                    let _permit = df.read_semaphore.acquire().await.unwrap();
                     let hash = match mode {
-                        PathCheckMode::Start => self.hash_file_chunk(&p, true, fsize).await,
-                        PathCheckMode::End => self.hash_file_chunk(&p, false, fsize).await,
+                        PathCheckMode::Start => df.hash_file_chunk(&p, true, fsize).await,
+                        PathCheckMode::End => df.hash_file_chunk(&p, false, fsize).await,
                         PathCheckMode::Full => {
                             let p = p.clone();
                             tokio::task::spawn_blocking(move || {
-                                if self.disable_mmap {
+                                if df.disable_mmap {
                                     hash_file(&p)
                                 } else {
                                     hash_mmap_file(&p)
                                 }
                             })
-                            .await
-                            .unwrap()
+                                .await
+                                .unwrap()
                         }
                     };
                     (p, hash)
@@ -180,12 +182,13 @@ impl DupeFinder {
     }
 
     pub async fn traverse_paths(
-        &'static self,
+        &self,
         paths: Vec<String>,
     ) -> Result<SizeMap, std::io::Error> {
         let now = Instant::now();
         let (tx, mut rx) = mpsc::channel::<(String, std::fs::Metadata)>(1024);
 
+        let df = self.clone();
         let handle = tokio::spawn(async move {
             #[cfg(unix)]
             let mut inodes = HashSet::<u64>::new();
@@ -213,7 +216,7 @@ impl DupeFinder {
                 let new_inode = true;
 
                 if new_inode {
-                    if metadata.len() >= self.min_file_size {
+                    if metadata.len() >= df.min_file_size {
                         n += 1;
                         size_total += metadata.len();
                         size_map.entry(metadata.len()).or_default().push(path);
@@ -306,7 +309,7 @@ impl DupeFinder {
     }
 
     pub async fn check_hashes_and_content(
-        &'static self,
+        &self,
         size_map: SizeMap,
         dupes_tx: Sender<DupeSet>,
     ) -> std::io::Result<()> {
@@ -319,24 +322,25 @@ impl DupeFinder {
             let pbar = pbar.clone();
             let dupes_tx = dupes_tx.clone();
             let permit = task_semaphore.clone().acquire_owned();
+            let df = Arc::new(self.clone());
             spawner.spawn(|tracker| async move {
                 let _tracker = tracker;
 
-                let candidates = self.dedupe_paths(fsize, paths, PathCheckMode::Start).await;
+                let candidates = df.dedupe_paths(fsize, paths, PathCheckMode::Start).await;
 
                 for fpaths in candidates.into_values() {
                     if fpaths.len() > 1 {
-                        let candidates = self.dedupe_paths(fsize, fpaths, PathCheckMode::End).await;
+                        let candidates = df.dedupe_paths(fsize, fpaths, PathCheckMode::End).await;
                         for bpaths in candidates.into_values() {
                             if bpaths.len() > 1 {
                                 let candidates =
-                                    self.dedupe_paths(fsize, bpaths, PathCheckMode::Full).await;
+                                    df.dedupe_paths(fsize, bpaths, PathCheckMode::Full).await;
                                 for dupes in candidates.into_values() {
                                     if dupes.len() > 1 {
                                         debug!("Dupes found: {:?}", dupes);
-                                        self.dupe_files
+                                        df.dupe_files
                                             .fetch_add((dupes.len() - 1) as u64, Ordering::Relaxed);
-                                        self.dupe_sizes.fetch_add(
+                                        df.dupe_sizes.fetch_add(
                                             (dupes.len() - 1) as u64 * fsize,
                                             Ordering::Relaxed,
                                         );
@@ -396,7 +400,7 @@ fn hash_file(path: &str) -> std::io::Result<Hash> {
 
 fn chain_dirs(
     dirs: Vec<String>,
-) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> {
+) -> impl Iterator<Item=Result<walkdir::DirEntry, walkdir::Error>> {
     dirs.into_iter().flat_map(|s| {
         WalkDir::new(s)
             .follow_root_links(true)

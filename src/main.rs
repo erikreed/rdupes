@@ -71,8 +71,7 @@ async fn main() -> std::io::Result<()> {
         disable_mmap: args.disable_mmap,
     };
     let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
-    let df = Box::leak(Box::new(DupeFinder::new(params)));
-
+    let df = DupeFinder::new(params);
     let now = Instant::now();
 
     let size_map = {
@@ -94,7 +93,7 @@ async fn main() -> std::io::Result<()> {
             .map_err(|e| error!("Failed to save checkpoint data: {e:?}"));
     }
 
-    let task = tokio::task::spawn(df.check_hashes_and_content(size_map, dupes_tx));
+    let task = tokio::task::spawn(async move { df.check_hashes_and_content(size_map, dupes_tx).await});
     let mut out = args
         .output_path
         .map(|f| f.create().expect("Unable to open output file"));
