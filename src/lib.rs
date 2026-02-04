@@ -24,6 +24,7 @@ const EDGE_SIZE: usize = 4096;
 
 type Hash = [u8; 32];
 type TVString = TinyVec<[String; 4]>;
+type FileKey = (u64, u64);
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct PathGroup {
@@ -31,7 +32,7 @@ pub struct PathGroup {
     pub inode: u64,
 }
 
-type SizeMap = HashMap<u64, Vec<PathGroup>>;
+type SizeMap = HashMap<u64, TinyVec<[PathGroup; 2]>>;
 
 pub struct DupeParams {
     pub min_file_size: u64,
@@ -139,13 +140,16 @@ impl DupeFinder {
         Ok(*hash.as_bytes())
     }
 
-    pub async fn dedupe_paths(
+    pub async fn dedupe_paths<I>(
         &self,
         fsize: u64,
-        groups: Vec<PathGroup>,
+        groups: I,
         mode: PathCheckMode,
-    ) -> HashMap<Hash, Vec<PathGroup>> {
-        let mut candidates: HashMap<Hash, Vec<PathGroup>> = HashMap::with_capacity(groups.len());
+    ) -> HashMap<Hash, TinyVec<[PathGroup; 2]>>
+    where
+        I: IntoIterator<Item = PathGroup>,
+    {
+        let mut candidates: HashMap<Hash, TinyVec<[PathGroup; 2]>> = HashMap::new();
 
         for task in groups
             .into_iter()
@@ -196,7 +200,7 @@ impl DupeFinder {
         let df = self.clone();
         let handle = tokio::spawn(async move {
             #[cfg(unix)]
-            let mut size_inode_to_idx = HashMap::<(u64, u64), usize>::new();
+            let mut size_inode_to_idx = HashMap::<FileKey, usize>::new();
 
             let mut size_map = SizeMap::new();
             let mut n = 0u64;
@@ -226,8 +230,10 @@ impl DupeFinder {
                     #[cfg(unix)]
                     {
                         if let Some(&idx) = size_inode_to_idx.get(&(fsize, inode)) {
-                            size_map.get_mut(&fsize).unwrap()[idx].paths.push(path);
-                            n_hardlinks += 1;
+                            if let Some(groups) = size_map.get_mut(&fsize) {
+                                groups[idx].paths.push(path);
+                                n_hardlinks += 1;
+                            }
                         } else {
                             let groups = size_map.entry(fsize).or_default();
                             size_inode_to_idx.insert((fsize, inode), groups.len());
@@ -455,14 +461,13 @@ mod tests {
 
     #[tokio::test]
     async fn hard_link_duplicates() {
-        let test_dir = "test_hard_links_unit";
-        let _ = std::fs::remove_dir_all(test_dir);
-        std::fs::create_dir_all(test_dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let test_dir = temp.path();
 
-        let f1 = std::path::Path::new(test_dir).join("file1").to_string_lossy().to_string();
-        let f1_hl = std::path::Path::new(test_dir).join("file1_hl").to_string_lossy().to_string();
-        let f2 = std::path::Path::new(test_dir).join("file2").to_string_lossy().to_string();
-        let f2_hl = std::path::Path::new(test_dir).join("file2_hl").to_string_lossy().to_string();
+        let f1 = test_dir.join("file1").to_string_lossy().to_string();
+        let f1_hl = test_dir.join("file1_hl").to_string_lossy().to_string();
+        let f2 = test_dir.join("file2").to_string_lossy().to_string();
+        let f2_hl = test_dir.join("file2_hl").to_string_lossy().to_string();
 
         std::fs::write(&f1, b"common content").unwrap();
         std::fs::hard_link(&f1, &f1_hl).unwrap();
@@ -475,7 +480,10 @@ mod tests {
             disable_mmap: true,
         });
 
-        let size_map = df.traverse_paths(vec![test_dir.to_string()]).await.unwrap();
+        let size_map = df
+            .traverse_paths(vec![test_dir.to_string_lossy().to_string()])
+            .await
+            .unwrap();
         let (tx, mut rx) = mpsc::channel(10);
 
         df.check_hashes_and_content(size_map, tx).await.unwrap();

@@ -764,6 +764,7 @@ dependencies = [
  "mimalloc",
  "serde",
  "simple_logger",
+ "tempfile",
  "tinyvec",
  "tokio",
  "tokio-task-tracker",
