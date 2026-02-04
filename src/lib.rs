@@ -453,6 +453,49 @@ pub enum PathCheckMode {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn hard_link_duplicates() {
+        let test_dir = "test_hard_links_unit";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+
+        let f1 = format!("{}/file1", test_dir);
+        let f1_hl = format!("{}/file1_hl", test_dir);
+        let f2 = format!("{}/file2", test_dir);
+        let f2_hl = format!("{}/file2_hl", test_dir);
+
+        std::fs::write(&f1, b"common content").unwrap();
+        std::fs::hard_link(&f1, &f1_hl).unwrap();
+        std::fs::write(&f2, b"common content").unwrap();
+        std::fs::hard_link(&f2, &f2_hl).unwrap();
+
+        let df = DupeFinder::new(DupeParams {
+            min_file_size: 0,
+            read_concurrency: 1,
+            disable_mmap: true,
+        });
+
+        let size_map = df.traverse_paths(vec![test_dir.to_string()]).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(10);
+
+        df.check_hashes_and_content(size_map, tx).await.unwrap();
+
+        let mut all_paths = Vec::new();
+        while let Some(ds) = rx.recv().await {
+            for p in ds.paths {
+                all_paths.push(p);
+            }
+        }
+        all_paths.sort();
+
+        let mut expected = vec![f1, f1_hl, f2, f2_hl];
+        expected.sort();
+
+        assert_eq!(all_paths, expected);
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
     #[test]
     fn sorting() {
         let input_paths = vec!["/asd/".into(), "/def/".into(), "/tmp/asd/".into()];
