@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, SeekFrom};
 #[cfg(unix)]
-use std::os::linux::fs::MetadataExt;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -211,7 +211,7 @@ impl DupeFinder {
                 size_pbar.update(metadata.len() as usize).unwrap();
 
                 #[cfg(unix)]
-                let new_inode = inodes.insert(metadata.st_ino());
+                let new_inode = inodes.insert(metadata.ino());
                 #[cfg(not(unix))]
                 let new_inode = true;
 
