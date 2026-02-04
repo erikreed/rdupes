@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, SeekFrom};
@@ -103,9 +104,10 @@ impl DupeProgress {
         }
     }
 
-    fn update(&mut self, size: usize) {
-        self.pbar_count.update(1).unwrap();
-        self.pbar_size.update(size).unwrap();
+    fn update(&mut self, size: usize) -> anyhow::Result<()> {
+        self.pbar_count.update(1).context("Failed to update count progress bar")?;
+        self.pbar_size.update(size).context("Failed to update size progress bar")?;
+        Ok(())
     }
 }
 
@@ -121,8 +123,8 @@ impl DupeFinder {
         }
     }
 
-    async fn hash_file_chunk(&self, path: &str, front: bool, fsize: u64) -> std::io::Result<Hash> {
-        let f = File::open(path).await?;
+    async fn hash_file_chunk(&self, path: &str, front: bool, fsize: u64) -> anyhow::Result<Hash> {
+        let f = File::open(path).await.with_context(|| format!("Failed to open {}", path))?;
 
         let mut reader = BufReader::new(f);
         let bufsize = EDGE_SIZE.min(self.min_file_size as usize);
@@ -131,10 +133,10 @@ impl DupeFinder {
 
         if !front && fsize > EDGE_SIZE as u64 {
             let pos = fsize - EDGE_SIZE as u64;
-            reader.seek(SeekFrom::Start(pos)).await.unwrap();
+            reader.seek(SeekFrom::Start(pos)).await.context("Failed to seek")?;
         }
 
-        let n = reader.read(&mut buf).await?;
+        let n = reader.read(&mut buf).await.context("Failed to read")?;
 
         let hash = blake3::hash(&buf[0..n]);
         Ok(*hash.as_bytes())
@@ -145,7 +147,7 @@ impl DupeFinder {
         fsize: u64,
         groups: I,
         mode: PathCheckMode,
-    ) -> HashMap<Hash, TinyVec<[PathGroup; 2]>>
+    ) -> anyhow::Result<HashMap<Hash, TinyVec<[PathGroup; 2]>>>
     where
         I: IntoIterator<Item = PathGroup>,
     {
@@ -156,30 +158,33 @@ impl DupeFinder {
             .map(|group| {
                 let df = self.clone();
                 tokio::spawn(async move {
-                    let _permit = df.read_semaphore.acquire().await.unwrap();
+                    let _permit = df
+                        .read_semaphore
+                        .acquire()
+                        .await
+                        .context("Failed to acquire read semaphore")?;
                     let p = group.paths[0].clone();
                     let hash = match mode {
                         PathCheckMode::Start => df.hash_file_chunk(&p, true, fsize).await,
                         PathCheckMode::End => df.hash_file_chunk(&p, false, fsize).await,
-                        PathCheckMode::Full => {
-                            tokio::task::spawn_blocking(move || {
-                                if df.disable_mmap {
-                                    hash_file(&p)
-                                } else {
-                                    hash_mmap_file(&p)
-                                }
-                            })
-                            .await
-                            .unwrap()
-                        }
+                        PathCheckMode::Full => tokio::task::spawn_blocking(move || {
+                            if df.disable_mmap {
+                                hash_file(&p)
+                            } else {
+                                hash_mmap_file(&p)
+                            }
+                        })
+                        .await
+                        .context("Full hash task panicked")
+                        .map(|res| res.map_err(anyhow::Error::from))?,
                     };
-                    (group, hash)
+                    Ok::<_, anyhow::Error>((group, hash))
                 })
             })
             .collect::<FuturesUnordered<_>>()
             .into_iter()
         {
-            let (group, hash) = task.await.unwrap();
+            let (group, hash) = task.await.context("Dedupe task panicked")??;
             match hash {
                 Ok(hash) => {
                     candidates.entry(hash).or_default().push(group);
@@ -187,13 +192,13 @@ impl DupeFinder {
                 Err(e) => warn!("Failed to hash {}: {}", group.paths[0], e),
             }
         }
-        candidates
+        Ok(candidates)
     }
 
     pub async fn traverse_paths(
         &self,
         paths: Vec<String>,
-    ) -> Result<SizeMap, std::io::Error> {
+    ) -> anyhow::Result<SizeMap> {
         let now = Instant::now();
         let (tx, mut rx) = mpsc::channel::<(String, std::fs::Metadata)>(1024);
 
@@ -219,8 +224,12 @@ impl DupeFinder {
                 unit_scale = true
             );
             while let Some((path, metadata)) = rx.recv().await {
-                file_pbar.update(1).unwrap();
-                size_pbar.update(metadata.len() as usize).unwrap();
+                file_pbar
+                    .update(1)
+                    .context("Failed to update file progress bar")?;
+                size_pbar
+                    .update(metadata.len() as usize)
+                    .context("Failed to update size progress bar")?;
 
                 let fsize = metadata.len();
                 #[cfg(unix)]
@@ -280,7 +289,7 @@ impl DupeFinder {
                     format_size(largest.0 * largest.1.len() as u64, BINARY)
                 )
             }
-            size_map
+            Ok::<SizeMap, anyhow::Error>(size_map)
         });
 
         let num_directories = Arc::new(AtomicU64::new(0));
@@ -307,9 +316,9 @@ impl DupeFinder {
                 match symlink_metadata(entry.path()).await {
                     Ok(metadata) => {
                         if metadata.is_file() {
-                            tx.send((entry.path().to_string_lossy().to_string(), metadata))
-                                .await
-                                .unwrap();
+                            let _ = tx
+                                .send((entry.path().to_string_lossy().to_string(), metadata))
+                                .await;
                         } else {
                             num_directories.fetch_add(1, Ordering::Relaxed);
                         }
@@ -317,7 +326,7 @@ impl DupeFinder {
                     Err(e) => {
                         info!(
                             "Failed to get metadata for {}: {}",
-                            entry.path().to_str().unwrap(),
+                            entry.path().to_string_lossy(),
                             e
                         );
                         errors.fetch_add(1, Ordering::Relaxed);
@@ -332,7 +341,7 @@ impl DupeFinder {
         info!("Directories traversed: {:?}", num_directories);
         info!("Errors during traversal: {:?}", errors);
 
-        let size_map = handle.await?;
+        let size_map = handle.await.context("Traversal handle panicked")??;
         info!(
             "Traversal completed in: {:.1}s",
             now.elapsed().as_secs_f32()
@@ -345,7 +354,7 @@ impl DupeFinder {
         &self,
         size_map: SizeMap,
         dupes_tx: Sender<DupeSet>,
-    ) -> std::io::Result<()> {
+    ) -> anyhow::Result<()> {
         let (spawner, waiter) = tokio_task_tracker::new();
         let pbar = Arc::new(Mutex::new(DupeProgress::new(&size_map)));
         let task_semaphore = Arc::new(Semaphore::new(self.read_concurrency.max(4)));
@@ -359,43 +368,53 @@ impl DupeFinder {
             spawner.spawn(|tracker| async move {
                 let _tracker = tracker;
 
-                let candidates = df.dedupe_paths(fsize, groups, PathCheckMode::Start).await;
+                let res = async {
+                    let candidates = df.dedupe_paths(fsize, groups, PathCheckMode::Start).await?;
 
-                for fgroups in candidates.into_values() {
-                    if fgroups.len() > 1 {
-                        let candidates = df.dedupe_paths(fsize, fgroups, PathCheckMode::End).await;
-                        for bgroups in candidates.into_values() {
-                            if bgroups.len() > 1 {
-                                let candidates =
-                                    df.dedupe_paths(fsize, bgroups, PathCheckMode::Full).await;
-                                for dupes in candidates.into_values() {
-                                    if dupes.len() > 1 {
-                                        debug!("Dupes found: {:?}", dupes);
-                                        let num_groups = dupes.len();
-                                        let all_paths: Vec<String> =
-                                            dupes.into_iter().flat_map(|g| g.paths).collect();
-                                        df.dupe_files.fetch_add(
-                                            (all_paths.len() - 1) as u64,
-                                            Ordering::Relaxed,
-                                        );
-                                        df.dupe_sizes.fetch_add(
-                                            (num_groups - 1) as u64 * fsize,
-                                            Ordering::Relaxed,
-                                        );
-                                        dupes_tx
-                                            .send(DupeSet {
-                                                fsize,
-                                                paths: all_paths,
-                                            })
-                                            .await
-                                            .expect("Failed to send to dupes_tx");
+                    for fgroups in candidates.into_values() {
+                        if fgroups.len() > 1 {
+                            let candidates =
+                                df.dedupe_paths(fsize, fgroups, PathCheckMode::End).await?;
+                            for bgroups in candidates.into_values() {
+                                if bgroups.len() > 1 {
+                                    let candidates = df
+                                        .dedupe_paths(fsize, bgroups, PathCheckMode::Full)
+                                        .await?;
+                                    for dupes in candidates.into_values() {
+                                        if dupes.len() > 1 {
+                                            debug!("Dupes found: {:?}", dupes);
+                                            let num_groups = dupes.len();
+                                            let all_paths: Vec<String> =
+                                                dupes.into_iter().flat_map(|g| g.paths).collect();
+                                            df.dupe_files.fetch_add(
+                                                (all_paths.len() - 1) as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                            df.dupe_sizes.fetch_add(
+                                                (num_groups - 1) as u64 * fsize,
+                                                Ordering::Relaxed,
+                                            );
+                                            let _ = dupes_tx
+                                                .send(DupeSet {
+                                                    fsize,
+                                                    paths: all_paths,
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    Ok::<(), anyhow::Error>(())
                 }
-                pbar.lock().await.update(fsize as usize);
+                .await;
+
+                if let Err(e) = res {
+                    error!("Failed to dedupe files of size {}: {}", fsize, e);
+                }
+
+                let _ = pbar.lock().await.update(fsize as usize);
                 drop(permit); // move permit into the tokio thread
             });
         }
@@ -460,8 +479,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn hard_link_duplicates() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn hard_link_duplicates() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
         let test_dir = temp.path();
 
         let f1 = test_dir.join("file1").to_string_lossy().to_string();
@@ -469,10 +488,10 @@ mod tests {
         let f2 = test_dir.join("file2").to_string_lossy().to_string();
         let f2_hl = test_dir.join("file2_hl").to_string_lossy().to_string();
 
-        std::fs::write(&f1, b"common content").unwrap();
-        std::fs::hard_link(&f1, &f1_hl).unwrap();
-        std::fs::write(&f2, b"common content").unwrap();
-        std::fs::hard_link(&f2, &f2_hl).unwrap();
+        std::fs::write(&f1, b"common content").context("Failed to write f1")?;
+        std::fs::hard_link(&f1, &f1_hl).context("Failed to link f1_hl")?;
+        std::fs::write(&f2, b"common content").context("Failed to write f2")?;
+        std::fs::hard_link(&f2, &f2_hl).context("Failed to link f2_hl")?;
 
         let df = DupeFinder::new(DupeParams {
             min_file_size: 0,
@@ -483,10 +502,10 @@ mod tests {
         let size_map = df
             .traverse_paths(vec![test_dir.to_string_lossy().to_string()])
             .await
-            .unwrap();
+            .context("Failed to traverse paths")?;
         let (tx, mut rx) = mpsc::channel(10);
 
-        df.check_hashes_and_content(size_map, tx).await.unwrap();
+        df.check_hashes_and_content(size_map, tx).await.context("Failed to check hashes")?;
 
         let mut all_paths = Vec::new();
         while let Some(ds) = rx.recv().await {
@@ -501,7 +520,8 @@ mod tests {
 
         assert_eq!(all_paths, expected);
 
-        std::fs::remove_dir_all(test_dir).unwrap();
+        std::fs::remove_dir_all(test_dir).context("Failed to remove test dir")?;
+        Ok(())
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::io::{BufReader, BufWriter};
 
+use anyhow::Context;
 use clap::Parser;
 use log::{error, info, LevelFilter};
 use mimalloc::MiMalloc;
@@ -50,7 +51,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let log_level = if args.verbose {
         LevelFilter::Debug
@@ -60,7 +61,7 @@ async fn main() -> std::io::Result<()> {
     simple_logger::SimpleLogger::new()
         .with_level(log_level)
         .init()
-        .unwrap();
+        .context("Failed to initialize logger")?;
 
     info!("Parameters: {:?}", args);
 
@@ -78,7 +79,7 @@ async fn main() -> std::io::Result<()> {
         if let Some(f) = args.checkpoint_load_path {
             info!("Reading checkpoint from: {:?}", f.path());
             let reader = BufReader::new(f);
-            ciborium::from_reader(reader).expect("Failed to parse checkpoint data")
+            ciborium::from_reader(reader).context("Failed to parse checkpoint data")?
         } else {
             info!("Traversing paths: {:?}", args.paths);
             df.traverse_paths(args.paths.clone()).await?
@@ -94,9 +95,11 @@ async fn main() -> std::io::Result<()> {
     }
 
     let task = tokio::task::spawn(async move { df.check_hashes_and_content(size_map, dupes_tx).await});
-    let mut out = args
-        .output_path
-        .map(|f| f.create().expect("Unable to open output file"));
+    let mut out = if let Some(output_path) = args.output_path {
+        Some(output_path.create().context("Unable to open output file")?)
+    } else {
+        None
+    };
     while let Some(mut ds) = dupes_rx.recv().await {
         if let Some(ref mut f) = out {
             ds.sort_paths(&args.paths);
@@ -107,7 +110,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    task.await??;
+    task.await.context("Dedupe task panicked")??;
     info!("Elapsed time: {:.1}s", now.elapsed().as_secs_f32());
 
     Ok(())

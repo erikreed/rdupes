@@ -8,6 +8,7 @@ description = "A rust port of pydupes. Super fast."
 
 
 [dependencies]
+anyhow = "1.0"
 async-fs = "2.1"
 blake3 = { version = "1.5", features = ["mmap"] }
 ciborium = "0.2.2"
