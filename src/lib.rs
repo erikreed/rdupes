@@ -1,6 +1,3 @@
-#[cfg(not(unix))]
-use std::collections::HashMap;
-#[cfg(unix)]
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, SeekFrom};
@@ -204,7 +201,10 @@ impl DupeFinder {
             let mut size_map = SizeMap::new();
             let mut n = 0u64;
             let mut n_filtered = 0u64;
+            #[cfg(unix)]
             let mut n_hardlinks = 0u64;
+            #[cfg(not(unix))]
+            let n_hardlinks = 0u64;
             let mut size_total = 0u64;
 
             let mut file_pbar = tqdm!(desc = "Traversing files", position = 0, unit = " file");
@@ -459,10 +459,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
         std::fs::create_dir_all(test_dir).unwrap();
 
-        let f1 = format!("{}/file1", test_dir);
-        let f1_hl = format!("{}/file1_hl", test_dir);
-        let f2 = format!("{}/file2", test_dir);
-        let f2_hl = format!("{}/file2_hl", test_dir);
+        let f1 = std::path::Path::new(test_dir).join("file1").to_string_lossy().to_string();
+        let f1_hl = std::path::Path::new(test_dir).join("file1_hl").to_string_lossy().to_string();
+        let f2 = std::path::Path::new(test_dir).join("file2").to_string_lossy().to_string();
+        let f2_hl = std::path::Path::new(test_dir).join("file2_hl").to_string_lossy().to_string();
 
         std::fs::write(&f1, b"common content").unwrap();
         std::fs::hard_link(&f1, &f1_hl).unwrap();
