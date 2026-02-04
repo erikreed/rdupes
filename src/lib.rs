@@ -1,7 +1,8 @@
 #[cfg(not(unix))]
 use std::collections::HashMap;
 #[cfg(unix)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -26,7 +27,14 @@ const EDGE_SIZE: usize = 4096;
 
 type Hash = [u8; 32];
 type TVString = TinyVec<[String; 4]>;
-type SizeMap = HashMap<u64, TVString>;
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct PathGroup {
+    pub paths: TVString,
+    pub inode: u64,
+}
+
+type SizeMap = HashMap<u64, Vec<PathGroup>>;
 
 pub struct DupeParams {
     pub min_file_size: u64,
@@ -137,22 +145,22 @@ impl DupeFinder {
     pub async fn dedupe_paths(
         &self,
         fsize: u64,
-        paths: TVString,
+        groups: Vec<PathGroup>,
         mode: PathCheckMode,
-    ) -> HashMap<Hash, TVString> {
-        let mut candidates: HashMap<Hash, TVString> = HashMap::with_capacity(paths.len());
+    ) -> HashMap<Hash, Vec<PathGroup>> {
+        let mut candidates: HashMap<Hash, Vec<PathGroup>> = HashMap::with_capacity(groups.len());
 
-        for task in paths
+        for task in groups
             .into_iter()
-            .map(|p| {
+            .map(|group| {
                 let df = self.clone();
                 tokio::spawn(async move {
                     let _permit = df.read_semaphore.acquire().await.unwrap();
+                    let p = group.paths[0].clone();
                     let hash = match mode {
                         PathCheckMode::Start => df.hash_file_chunk(&p, true, fsize).await,
                         PathCheckMode::End => df.hash_file_chunk(&p, false, fsize).await,
                         PathCheckMode::Full => {
-                            let p = p.clone();
                             tokio::task::spawn_blocking(move || {
                                 if df.disable_mmap {
                                     hash_file(&p)
@@ -160,22 +168,22 @@ impl DupeFinder {
                                     hash_mmap_file(&p)
                                 }
                             })
-                                .await
-                                .unwrap()
+                            .await
+                            .unwrap()
                         }
                     };
-                    (p, hash)
+                    (group, hash)
                 })
             })
             .collect::<FuturesUnordered<_>>()
             .into_iter()
         {
-            let (path, hash) = task.await.unwrap();
+            let (group, hash) = task.await.unwrap();
             match hash {
                 Ok(hash) => {
-                    candidates.entry(hash).or_default().push(path);
+                    candidates.entry(hash).or_default().push(group);
                 }
-                Err(e) => warn!("Failed to hash {}: {}", path, e),
+                Err(e) => warn!("Failed to hash {}: {}", group.paths[0], e),
             }
         }
         candidates
@@ -191,7 +199,7 @@ impl DupeFinder {
         let df = self.clone();
         let handle = tokio::spawn(async move {
             #[cfg(unix)]
-            let mut inodes = HashSet::<u64>::new();
+            let mut size_inode_to_idx = HashMap::<(u64, u64), usize>::new();
 
             let mut size_map = SizeMap::new();
             let mut n = 0u64;
@@ -210,21 +218,40 @@ impl DupeFinder {
                 file_pbar.update(1).unwrap();
                 size_pbar.update(metadata.len() as usize).unwrap();
 
+                let fsize = metadata.len();
                 #[cfg(unix)]
-                let new_inode = inodes.insert(metadata.ino());
-                #[cfg(not(unix))]
-                let new_inode = true;
+                let inode = metadata.ino();
 
-                if new_inode {
-                    if metadata.len() >= df.min_file_size {
+                if fsize >= df.min_file_size {
+                    #[cfg(unix)]
+                    {
+                        if let Some(&idx) = size_inode_to_idx.get(&(fsize, inode)) {
+                            size_map.get_mut(&fsize).unwrap()[idx].paths.push(path);
+                            n_hardlinks += 1;
+                        } else {
+                            let groups = size_map.entry(fsize).or_default();
+                            size_inode_to_idx.insert((fsize, inode), groups.len());
+                            let mut paths = TVString::default();
+                            paths.push(path);
+                            groups.push(PathGroup { paths, inode });
+                            n += 1;
+                            size_total += fsize;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let groups = size_map.entry(fsize).or_default();
+                        let mut paths = TVString::default();
+                        paths.push(path);
+                        groups.push(PathGroup {
+                            paths,
+                            inode: 0,
+                        });
                         n += 1;
-                        size_total += metadata.len();
-                        size_map.entry(metadata.len()).or_default().push(path);
-                    } else {
-                        n_filtered += 1;
+                        size_total += fsize;
                     }
                 } else {
-                    n_hardlinks += 1;
+                    n_filtered += 1;
                 }
             }
             drop(file_pbar);
@@ -318,7 +345,7 @@ impl DupeFinder {
         let task_semaphore = Arc::new(Semaphore::new(self.read_concurrency.max(4)));
 
         // TODO: remove redundant hash check for smaller file sizes: skip front/back checks
-        for (fsize, paths) in size_map.into_iter() {
+        for (fsize, groups) in size_map.into_iter() {
             let pbar = pbar.clone();
             let dupes_tx = dupes_tx.clone();
             let permit = task_semaphore.clone().acquire_owned();
@@ -326,28 +353,33 @@ impl DupeFinder {
             spawner.spawn(|tracker| async move {
                 let _tracker = tracker;
 
-                let candidates = df.dedupe_paths(fsize, paths, PathCheckMode::Start).await;
+                let candidates = df.dedupe_paths(fsize, groups, PathCheckMode::Start).await;
 
-                for fpaths in candidates.into_values() {
-                    if fpaths.len() > 1 {
-                        let candidates = df.dedupe_paths(fsize, fpaths, PathCheckMode::End).await;
-                        for bpaths in candidates.into_values() {
-                            if bpaths.len() > 1 {
+                for fgroups in candidates.into_values() {
+                    if fgroups.len() > 1 {
+                        let candidates = df.dedupe_paths(fsize, fgroups, PathCheckMode::End).await;
+                        for bgroups in candidates.into_values() {
+                            if bgroups.len() > 1 {
                                 let candidates =
-                                    df.dedupe_paths(fsize, bpaths, PathCheckMode::Full).await;
+                                    df.dedupe_paths(fsize, bgroups, PathCheckMode::Full).await;
                                 for dupes in candidates.into_values() {
                                     if dupes.len() > 1 {
                                         debug!("Dupes found: {:?}", dupes);
-                                        df.dupe_files
-                                            .fetch_add((dupes.len() - 1) as u64, Ordering::Relaxed);
+                                        let num_groups = dupes.len();
+                                        let all_paths: Vec<String> =
+                                            dupes.into_iter().flat_map(|g| g.paths).collect();
+                                        df.dupe_files.fetch_add(
+                                            (all_paths.len() - 1) as u64,
+                                            Ordering::Relaxed,
+                                        );
                                         df.dupe_sizes.fetch_add(
-                                            (dupes.len() - 1) as u64 * fsize,
+                                            (num_groups - 1) as u64 * fsize,
                                             Ordering::Relaxed,
                                         );
                                         dupes_tx
                                             .send(DupeSet {
                                                 fsize,
-                                                paths: dupes.into_iter().collect(),
+                                                paths: all_paths,
                                             })
                                             .await
                                             .expect("Failed to send to dupes_tx");
