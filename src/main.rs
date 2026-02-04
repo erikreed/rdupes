@@ -78,7 +78,10 @@ async fn main() -> std::io::Result<()> {
         if let Some(f) = args.checkpoint_load_path {
             info!("Reading checkpoint from: {:?}", f.path());
             let reader = BufReader::new(f);
-            ciborium::from_reader(reader).expect("Failed to parse checkpoint data")
+            ciborium::from_reader(reader).map_err(|e| {
+                error!("Failed to parse checkpoint data: {:?}", e);
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?
         } else {
             info!("Traversing paths: {:?}", args.paths);
             df.traverse_paths(args.paths.clone()).await?
@@ -89,14 +92,21 @@ async fn main() -> std::io::Result<()> {
         info!("Saving checkpoint to: {path:?}");
         let file = path.create()?;
         let writer = BufWriter::new(file);
-        let _ = ciborium::into_writer(&size_map, writer)
-            .map_err(|e| error!("Failed to save checkpoint data: {e:?}"));
+        if let Err(e) = ciborium::into_writer(&size_map, writer) {
+            error!("Failed to save checkpoint data: {e:?}");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+        }
     }
 
     let task = tokio::task::spawn(async move { df.check_hashes_and_content(size_map, dupes_tx).await});
-    let mut out = args
-        .output_path
-        .map(|f| f.create().expect("Unable to open output file"));
+    let mut out = if let Some(path) = args.output_path {
+        Some(path.create().map_err(|e| {
+            error!("Unable to open output file: {:?}", e);
+            e
+        })?)
+    } else {
+        None
+    };
     while let Some(mut ds) = dupes_rx.recv().await {
         if let Some(ref mut f) = out {
             ds.sort_paths(&args.paths);
