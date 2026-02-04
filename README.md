@@ -17,6 +17,35 @@ xargs -0 -n2 echo ln --force --verbose < dupes.txt
  cargo run -- --help
 A rust port of pydupes. Super fast.
 
+### Nix support
+
+If you have [Nix](https://nixos.org/) installed, you can build and run `rdupes` easily.
+
+#### Using Flakes
+
+```sh
+# Run directly
+nix run github:erikreed/rdupes -- --help
+
+# Build
+nix build
+./result/bin/rdupes --help
+
+# Development shell
+nix develop
+```
+
+#### Using traditional Nix
+
+```sh
+# Build
+nix-build
+./result/bin/rdupes --help
+
+# Development shell
+nix-shell
+```
+
 Usage: ./rdupes [OPTIONS] [PATHS]...
 
 Arguments:
