@@ -467,11 +467,13 @@ mod tests {
         let f1_hl = test_dir.join("file1_hl").to_string_lossy().to_string();
         let f2 = test_dir.join("file2").to_string_lossy().to_string();
         let f2_hl = test_dir.join("file2_hl").to_string_lossy().to_string();
+        let f3 = test_dir.join("file3").to_string_lossy().to_string();
 
         std::fs::write(&f1, b"common content").unwrap();
         std::fs::hard_link(&f1, &f1_hl).unwrap();
         std::fs::write(&f2, b"common content").unwrap();
         std::fs::hard_link(&f2, &f2_hl).unwrap();
+        std::fs::write(&f3, b"uncommon content").unwrap();
 
         let df = DupeFinder::new(DupeParams {
             min_file_size: 0,
