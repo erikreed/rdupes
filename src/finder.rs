@@ -137,6 +137,8 @@ impl DupeFinder {
         }
 
         drop(pbar);
+        eprintln!();
+        eprintln!();
         let dupes = results.values().filter(|v| v.len() > 1).count();
         info!(
             "{}: Processed {} files, found {} candidate groups",

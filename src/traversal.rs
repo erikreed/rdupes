@@ -150,6 +150,8 @@ pub async fn traverse_paths(
 
     while let Some(_) = set.join_next().await {}
 
+    eprintln!();
+    eprintln!();
     info!("Directories traversed: {:?}", num_directories);
     info!("Errors during traversal: {:?}", errors);
 
