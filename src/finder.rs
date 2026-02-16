@@ -67,6 +67,11 @@ impl DupeFinder {
         }
     }
 
+    /// Processes a wave of hashing tasks.
+    ///
+    /// `group_id` is used to maintain grouping context across waves. Since we process files in
+    /// a flat list to maintain disk locality, we only want to group files in the current wave
+    /// if they were already in the same candidate group in the previous wave.
     async fn process_wave(
         &self,
         tasks: Vec<(u64, usize, PathGroup)>, // (fsize, group_id, PathGroup)
@@ -74,10 +79,6 @@ impl DupeFinder {
         desc: &str,
     ) -> HashMap<(u64, usize, Hash), Vec<PathGroup>> {
         let count = tasks.len();
-        if count == 0 {
-            return HashMap::new();
-        }
-
         let total_size = tasks.iter().map(|(s, _, _)| *s).sum();
         let pbar = Arc::new(Mutex::new(DupeProgress::new(
             count,
@@ -89,9 +90,9 @@ impl DupeFinder {
         let mut set = JoinSet::new();
 
         for (fsize, group_id, group) in tasks {
+            let permit = self.read_semaphore.clone().acquire_owned().await.unwrap();
             let df = self.clone();
             let mode = mode_fn(fsize);
-            let permit = df.read_semaphore.clone().acquire_owned().await.unwrap();
             let path = group.paths[0].clone();
             set.spawn(async move {
                 let _permit = permit;
@@ -125,6 +126,7 @@ impl DupeFinder {
             }
         }
 
+        drop(pbar);
         let dupes = results.values().filter(|v| v.len() > 1).count();
         info!(
             "{}: Processed {} files, found {} candidate groups",
