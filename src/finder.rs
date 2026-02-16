@@ -69,9 +69,19 @@ impl DupeFinder {
 
     /// Processes a wave of hashing tasks.
     ///
-    /// `group_id` is used to maintain grouping context across waves. Since we process files in
-    /// a flat list to maintain disk locality, we only want to group files in the current wave
-    /// if they were already in the same candidate group in the previous wave.
+    /// `group_id` is used to maintain grouping context across waves.
+    /// Since we flatten all candidate groups into a single list to enable global
+    /// disk-locality sorting, we must ensure that files are only grouped together
+    /// if they matched in ALL previous hashing stages.
+    ///
+    /// Example:
+    /// File A: StartHash "X", EndHash "Y"
+    /// File B: StartHash "X", EndHash "Z"
+    /// File C: StartHash "W", EndHash "Y"
+    ///
+    /// After Wave 1 (Start), we have Group 1: [A, B] and Group 2: [C].
+    /// In Wave 2 (End), A and C both have EndHash "Y". Without `group_id`, they would
+    /// be incorrectly grouped together. `group_id` ensures A is only compared with B.
     async fn process_wave(
         &self,
         tasks: Vec<(u64, usize, PathGroup)>, // (fsize, group_id, PathGroup)
