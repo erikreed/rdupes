@@ -3,9 +3,8 @@ use std::io::{BufReader, BufWriter};
 use clap::Parser;
 use log::{error, info, LevelFilter};
 use mimalloc::MiMalloc;
-use rdupes::{DupeFinder, DupeParams, DupeSet};
+use rdupes::{DupeFinder, DupeParams};
 use std::io::Write;
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 #[global_allocator]
@@ -60,43 +59,57 @@ async fn main() -> std::io::Result<()> {
     simple_logger::SimpleLogger::new()
         .with_level(log_level)
         .init()
-        .unwrap();
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     info!("Parameters: {:?}", args);
 
-    assert!(args.read_concurrency > 0);
+    if args.read_concurrency == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read_concurrency must be greater than 0",
+        ));
+    }
+
     let params = DupeParams {
         min_file_size: args.min_file_size,
         read_concurrency: args.read_concurrency,
         disable_mmap: args.disable_mmap,
     };
-    let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
     let df = DupeFinder::new(params);
     let now = Instant::now();
 
-    let size_map = {
-        if let Some(f) = args.checkpoint_load_path {
-            info!("Reading checkpoint from: {:?}", f.path());
-            let reader = BufReader::new(f);
-            ciborium::from_reader(reader).expect("Failed to parse checkpoint data")
-        } else {
-            info!("Traversing paths: {:?}", args.paths);
-            df.traverse_paths(args.paths.clone()).await?
-        }
+    let size_map = if let Some(f) = args.checkpoint_load_path {
+        info!("Reading checkpoint from: {:?}", f.path());
+        let reader = BufReader::new(f);
+        ciborium::from_reader(reader).map_err(|e| {
+            error!("Failed to parse checkpoint data: {:?}", e);
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?
+    } else {
+        info!("Traversing paths: {:?}", args.paths);
+        df.traverse_paths(args.paths.clone()).await?
     };
 
     if let Some(path) = args.checkpoint_save_path {
         info!("Saving checkpoint to: {path:?}");
         let file = path.create()?;
         let writer = BufWriter::new(file);
-        let _ = ciborium::into_writer(&size_map, writer)
-            .map_err(|e| error!("Failed to save checkpoint data: {e:?}"));
+        ciborium::into_writer(&size_map, writer).map_err(|e| {
+            error!("Failed to save checkpoint data: {:?}", e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
     }
 
-    let task = tokio::task::spawn(async move { df.check_hashes_and_content(size_map, dupes_tx).await});
+    let mut dupes_rx = df.find_duplicates(size_map);
     let mut out = args
         .output_path
-        .map(|f| f.create().expect("Unable to open output file"));
+        .map(|f| f.create())
+        .transpose()
+        .map_err(|e| {
+            error!("Unable to open output file: {:?}", e);
+            e
+        })?;
+
     while let Some(mut ds) = dupes_rx.recv().await {
         if let Some(ref mut f) = out {
             ds.sort_paths(&args.paths);
@@ -107,7 +120,6 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    task.await??;
     info!("Elapsed time: {:.1}s", now.elapsed().as_secs_f32());
 
     Ok(())
