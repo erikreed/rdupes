@@ -11,8 +11,9 @@ use humansize::{format_size, BINARY};
 use kdam::{tqdm, Bar, BarExt};
 use log::{debug, error, info, warn};
 use tinyvec::TinyVec;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::{Mutex, Semaphore};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::types::{DupeParams, DupeSet, Hash, PathCheckMode, SizeMap, EDGE_SIZE};
 use crate::hashing::{hash_file, hash_mmap_file};
@@ -141,6 +142,17 @@ impl DupeFinder {
         Ok(candidates)
     }
 
+    pub fn find_duplicates(&self, size_map: SizeMap) -> ReceiverStream<DupeSet> {
+        let (tx, rx) = mpsc::channel(32);
+        let df = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = df.check_hashes_and_content(size_map, tx).await {
+                error!("Error checking hashes and content: {}", e);
+            }
+        });
+        ReceiverStream::new(rx)
+    }
+
     pub async fn check_hashes_and_content(
         &self,
         size_map: SizeMap,
@@ -188,7 +200,9 @@ impl DupeFinder {
                 Ok::<(), std::io::Error>(())
             });
         }
-        while let Some(_) = set.join_next().await {}
+        while let Some(res) = set.join_next().await {
+            res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+        }
         drop(pbar);
         info!("Dupes found: {:?}", self.dupe_files.load(Ordering::Relaxed));
         info!(

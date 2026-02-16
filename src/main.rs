@@ -3,10 +3,10 @@ use std::io::{BufReader, BufWriter};
 use clap::Parser;
 use log::{error, info, LevelFilter};
 use mimalloc::MiMalloc;
-use rdupes::{DupeFinder, DupeParams, DupeSet};
+use rdupes::{DupeFinder, DupeParams};
 use std::io::Write;
-use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tokio_stream::StreamExt;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -70,7 +70,6 @@ async fn main() -> std::io::Result<()> {
         read_concurrency: args.read_concurrency,
         disable_mmap: args.disable_mmap,
     };
-    let (dupes_tx, mut dupes_rx) = mpsc::channel::<DupeSet>(32);
     let df = DupeFinder::new(params);
     let now = Instant::now();
 
@@ -98,7 +97,6 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    let task = tokio::task::spawn(async move { df.check_hashes_and_content(size_map, dupes_tx).await});
     let mut out = if let Some(path) = args.output_path {
         Some(path.create().map_err(|e| {
             error!("Unable to open output file: {:?}", e);
@@ -107,7 +105,9 @@ async fn main() -> std::io::Result<()> {
     } else {
         None
     };
-    while let Some(mut ds) = dupes_rx.recv().await {
+
+    let mut stream = df.find_duplicates(size_map);
+    while let Some(mut ds) = stream.next().await {
         if let Some(ref mut f) = out {
             ds.sort_paths(&args.paths);
             let source = &ds.paths[0];
@@ -117,7 +117,6 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    task.await??;
     info!("Elapsed time: {:.1}s", now.elapsed().as_secs_f32());
 
     Ok(())
