@@ -86,6 +86,7 @@ pub async fn traverse_paths(
         }
         drop(file_pbar);
         drop(size_pbar);
+        eprintln!();
         size_map.retain(|_, v| v.len() > 1);
 
         info!("Files to check: {}", n);
