@@ -90,7 +90,6 @@ impl DupeFinder {
     ) -> HashMap<(u64, usize, Hash), Vec<PathGroup>> {
         let count = tasks.len();
         let total_size = tasks.iter().map(|(s, _, _)| *s).sum();
-        eprintln!();
         let pbar = Arc::new(Mutex::new(DupeProgress::new(
             count,
             total_size,
@@ -138,6 +137,7 @@ impl DupeFinder {
         }
 
         drop(pbar);
+        eprintln!();
         eprintln!();
         let dupes = results.values().filter(|v| v.len() > 1).count();
         info!(

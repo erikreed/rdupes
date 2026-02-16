@@ -86,7 +86,6 @@ pub async fn traverse_paths(
         }
         drop(file_pbar);
         drop(size_pbar);
-        eprintln!();
         size_map.retain(|_, v| v.len() > 1);
 
         info!("Files to check: {}", n);
@@ -151,6 +150,8 @@ pub async fn traverse_paths(
 
     while let Some(_) = set.join_next().await {}
 
+    eprintln!();
+    eprintln!();
     info!("Directories traversed: {:?}", num_directories);
     info!("Errors during traversal: {:?}", errors);
 
