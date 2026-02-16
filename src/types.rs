@@ -6,13 +6,14 @@ pub const EDGE_SIZE: usize = 4096;
 
 pub type Hash = [u8; 32];
 pub type TVString = TinyVec<[String; 4]>;
+pub type FileKey = (u64, u64);
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct PathGroup {
     pub paths: TVString,
+    pub inode: u64,
 }
 
-pub type FileKey = (u64, u64); // (size, inode)
 pub type SizeMap = HashMap<u64, TinyVec<[PathGroup; 2]>>;
 
 #[derive(Debug)]

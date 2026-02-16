@@ -1,22 +1,21 @@
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use humansize::{format_size, BINARY};
+use kdam::{tqdm, Bar, BarExt};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use tokio::fs::File;
-use futures::stream::FuturesUnordered;
-use tokio::io::{BufReader, AsyncReadExt, AsyncSeekExt};
-use humansize::{format_size, BINARY};
-use kdam::{tqdm, Bar, BarExt};
-use log::{debug, error, info, warn};
 use tinyvec::TinyVec;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::types::{DupeParams, DupeSet, Hash, PathCheckMode, SizeMap, EDGE_SIZE};
 use crate::hashing::{hash_file, hash_mmap_file};
+use crate::types::{DupeParams, DupeSet, Hash, PathCheckMode, PathGroup, SizeMap, EDGE_SIZE};
 
 #[derive(Clone)]
 pub struct DupeFinder {
@@ -94,10 +93,10 @@ impl DupeFinder {
     pub async fn dedupe_paths(
         &self,
         fsize: u64,
-        groups: TinyVec<[crate::types::PathGroup; 2]>,
+        groups: TinyVec<[PathGroup; 2]>,
         mode: PathCheckMode,
-    ) -> std::io::Result<HashMap<Hash, TinyVec<[crate::types::PathGroup; 2]>>> {
-        let mut candidates: HashMap<Hash, TinyVec<[crate::types::PathGroup; 2]>> =
+    ) -> std::io::Result<HashMap<Hash, TinyVec<[PathGroup; 2]>>> {
+        let mut candidates: HashMap<Hash, TinyVec<[PathGroup; 2]>> =
             HashMap::with_capacity(groups.len());
 
         let mut futures = FuturesUnordered::new();
@@ -126,7 +125,7 @@ impl DupeFinder {
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
                     }
                 };
-                Ok::<(crate::types::PathGroup, std::io::Result<Hash>), std::io::Error>((g, hash))
+                Ok::<(PathGroup, std::io::Result<Hash>), std::io::Error>((g, hash))
             }));
         }
 
@@ -168,7 +167,7 @@ impl DupeFinder {
             let permit = task_semaphore.clone().acquire_owned();
             let df = Arc::new(self.clone());
             set.spawn(async move {
-                if fsize <= crate::types::EDGE_SIZE as u64 {
+                if fsize <= EDGE_SIZE as u64 {
                     let candidates = df.dedupe_paths(fsize, groups, PathCheckMode::Full).await?;
                     for dgroups in candidates.into_values() {
                         let _ = report_dupes(&df, fsize, dgroups, &dupes_tx).await;
@@ -178,11 +177,13 @@ impl DupeFinder {
 
                     for fgroups in candidates.into_values() {
                         if fgroups.len() > 1 {
-                            let candidates = df.dedupe_paths(fsize, fgroups, PathCheckMode::End).await?;
+                            let candidates =
+                                df.dedupe_paths(fsize, fgroups, PathCheckMode::End).await?;
                             for bgroups in candidates.into_values() {
                                 if bgroups.len() > 1 {
-                                    let candidates =
-                                        df.dedupe_paths(fsize, bgroups, PathCheckMode::Full).await?;
+                                    let candidates = df
+                                        .dedupe_paths(fsize, bgroups, PathCheckMode::Full)
+                                        .await?;
                                     for dgroups in candidates.into_values() {
                                         let _ = report_dupes(&df, fsize, dgroups, &dupes_tx).await;
                                     }
@@ -216,10 +217,11 @@ impl DupeFinder {
 async fn report_dupes(
     df: &DupeFinder,
     fsize: u64,
-    groups: TinyVec<[crate::types::PathGroup; 2]>,
+    groups: TinyVec<[PathGroup; 2]>,
     dupes_tx: &Sender<DupeSet>,
 ) -> std::io::Result<()> {
     let mut all_paths = Vec::new();
+    let num_groups = groups.len();
     for g in groups {
         all_paths.extend(g.paths.into_iter());
     }
@@ -229,7 +231,7 @@ async fn report_dupes(
         df.dupe_files
             .fetch_add((all_paths.len() - 1) as u64, Ordering::Relaxed);
         df.dupe_sizes
-            .fetch_add((all_paths.len() - 1) as u64 * fsize, Ordering::Relaxed);
+            .fetch_add((num_groups - 1) as u64 * fsize, Ordering::Relaxed);
         dupes_tx
             .send(DupeSet {
                 fsize,
