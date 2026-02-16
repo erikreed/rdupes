@@ -57,8 +57,10 @@ impl DupeProgress {
 }
 
 struct WaveResults {
-    groups: HashMap<(u64, Hash), TinyVec<[PathGroup; 2]>>,
-    hashes: HashMap<(u64, u64), Hash>, // (fsize, inode) -> Hash
+    // (fsize, hash) -> list of indices into all_tasks
+    groups: HashMap<(u64, Hash), TinyVec<[usize; 2]>>,
+    // index into all_tasks -> hash
+    hashes: HashMap<usize, Hash>,
 }
 
 impl WaveResults {
@@ -86,23 +88,21 @@ impl DupeFinder {
         }
     }
 
-    async fn process_wave<I>(
+    async fn process_wave(
         &self,
-        tasks: I,
+        all_tasks: &[(u64, PathGroup)],
+        indices: Vec<usize>,
         mode_fn: impl Fn(u64) -> PathCheckMode,
         desc: &str,
-    ) -> WaveResults
-    where
-        I: IntoIterator<Item = (u64, PathGroup)>,
-    {
-        let tasks: Vec<(u64, PathGroup)> = tasks.into_iter().collect();
-        if tasks.is_empty() {
+    ) -> WaveResults {
+        let count = indices.len();
+        if count == 0 {
             return WaveResults::new();
         }
 
-        let total_size = tasks.iter().map(|(s, _)| *s).sum();
+        let total_size = indices.iter().map(|&i| all_tasks[i].0).sum();
         let pbar = Arc::new(Mutex::new(DupeProgress::new(
-            tasks.len(),
+            count,
             total_size,
             desc.to_string(),
         )));
@@ -110,23 +110,25 @@ impl DupeFinder {
         let mut results = WaveResults::new();
         let mut set = JoinSet::new();
 
-        for (fsize, group) in tasks {
+        for i in indices {
+            let (fsize, group) = &all_tasks[i];
             let df = self.clone();
-            let mode = mode_fn(fsize);
+            let mode = mode_fn(*fsize);
             let pbar = pbar.clone();
             let permit = df.read_semaphore.clone().acquire_owned().await.unwrap();
+            let path = group.paths[0].clone();
+            let fsize = *fsize;
             set.spawn(async move {
                 let _permit = permit;
-                let p = group.paths[0].clone();
                 let hash = match mode {
-                    PathCheckMode::Start => hash_file_chunk(&p, true, fsize, df.min_file_size).await,
-                    PathCheckMode::End => hash_file_chunk(&p, false, fsize, df.min_file_size).await,
+                    PathCheckMode::Start => hash_file_chunk(&path, true, fsize, df.min_file_size).await,
+                    PathCheckMode::End => hash_file_chunk(&path, false, fsize, df.min_file_size).await,
                     PathCheckMode::Full => {
                         tokio::task::spawn_blocking(move || {
                             if df.disable_mmap {
-                                hash_file(&p)
+                                hash_file(&path)
                             } else {
-                                hash_mmap_file(&p)
+                                hash_mmap_file(&path)
                             }
                         })
                         .await
@@ -134,21 +136,27 @@ impl DupeFinder {
                     }
                 };
                 pbar.lock().await.update(fsize as usize);
-                (fsize, group, hash)
+                (i, fsize, hash)
             });
         }
 
         while let Some(res) = set.join_next().await {
-            let (fsize, group, hash) = res.unwrap();
-            let inode = group.inode;
+            let (i, fsize, hash) = res.unwrap();
             match hash {
                 Ok(hash) => {
-                    results.groups.entry((fsize, hash)).or_default().push(group);
-                    results.hashes.insert((fsize, inode), hash);
+                    results.groups.entry((fsize, hash)).or_default().push(i);
+                    results.hashes.insert(i, hash);
                 }
-                Err(e) => warn!("Failed to hash {}: {}", group.paths[0], e),
+                Err(e) => warn!("Failed to hash {}: {}", all_tasks[i].1.paths[0], e),
             }
         }
+
+        let dupes = results.groups.values().filter(|v| v.len() > 1).count();
+        info!(
+            "{}: Processed {} files, found {} candidate groups",
+            desc, count, dupes
+        );
+
         results
     }
 
@@ -183,7 +191,8 @@ impl DupeFinder {
         // Wave 1: Start or Full
         let wave1_results = self
             .process_wave(
-                all_tasks.iter().cloned(),
+                &all_tasks,
+                (0..all_tasks.len()).collect(),
                 |fsize| {
                     if fsize <= crate::hashing::EDGE_SIZE as u64 {
                         PathCheckMode::Full
@@ -196,35 +205,35 @@ impl DupeFinder {
             .await;
 
         // Wave 2: End hashing for large files
-        let wave2_tasks: Vec<(u64, PathGroup)> = all_tasks
-            .iter()
-            .filter(|(fsize, group)| {
-                if let Some(hash) = wave1_results.hashes.get(&(*fsize, group.inode)) {
+        let wave2_indices: Vec<usize> = (0..all_tasks.len())
+            .filter(|&i| {
+                let (fsize, _) = &all_tasks[i];
+                if let Some(hash) = wave1_results.hashes.get(&i) {
                     *fsize > crate::hashing::EDGE_SIZE as u64 && wave1_results.is_dupe(*fsize, hash)
                 } else {
                     false
                 }
             })
-            .cloned()
             .collect();
 
         let wave2_results = self
             .process_wave(
-                wave2_tasks,
+                &all_tasks,
+                wave2_indices,
                 |_| PathCheckMode::End,
                 "Wave 2/3 (End)",
             )
             .await;
 
         // Wave 3: Full hashing
-        let wave3_tasks: Vec<(u64, PathGroup)> = all_tasks
-            .iter()
-            .filter(|(fsize, group)| {
+        let wave3_indices: Vec<usize> = (0..all_tasks.len())
+            .filter(|&i| {
+                let (fsize, _) = &all_tasks[i];
                 if *fsize <= crate::hashing::EDGE_SIZE as u64 {
                     return false;
                 }
                 // Must have survived Wave 1
-                if let Some(h1) = wave1_results.hashes.get(&(*fsize, group.inode)) {
+                if let Some(h1) = wave1_results.hashes.get(&i) {
                     if !wave1_results.is_dupe(*fsize, h1) {
                         return false;
                     }
@@ -232,18 +241,18 @@ impl DupeFinder {
                     return false;
                 }
                 // Must have survived Wave 2
-                if let Some(h2) = wave2_results.hashes.get(&(*fsize, group.inode)) {
+                if let Some(h2) = wave2_results.hashes.get(&i) {
                     wave2_results.is_dupe(*fsize, h2)
                 } else {
                     false
                 }
             })
-            .cloned()
             .collect();
 
         let wave3_results = self
             .process_wave(
-                wave3_tasks,
+                &all_tasks,
+                wave3_indices,
                 |_| PathCheckMode::Full,
                 "Wave 3/3 (Full)",
             )
@@ -253,21 +262,24 @@ impl DupeFinder {
         // Small files from Wave 1 results that are dupes
         // Large files from Wave 3 results that are dupes
         let mut final_groups = Vec::new();
-        for ((fsize, _hash), groups) in wave1_results.groups {
-            if fsize <= crate::hashing::EDGE_SIZE as u64 && groups.len() > 1 {
-                final_groups.push((fsize, groups));
+        for ((fsize, _hash), indices) in wave1_results.groups {
+            if fsize <= crate::hashing::EDGE_SIZE as u64 && indices.len() > 1 {
+                final_groups.push((fsize, indices));
             }
         }
-        for ((fsize, _hash), groups) in wave3_results.groups {
-            if groups.len() > 1 {
-                final_groups.push((fsize, groups));
+        for ((fsize, _hash), indices) in wave3_results.groups {
+            if indices.len() > 1 {
+                final_groups.push((fsize, indices));
             }
         }
 
-        for (fsize, groups) in final_groups {
-            debug!("Dupes found: {:?}", groups);
-            let num_groups = groups.len();
-            let all_paths: Vec<String> = groups.into_iter().flat_map(|g| g.paths).collect();
+        for (fsize, indices) in final_groups {
+            let num_groups = indices.len();
+            let all_paths: Vec<String> = indices
+                .into_iter()
+                .flat_map(|i| all_tasks[i].1.paths.clone())
+                .collect();
+            debug!("Dupes found: {:?}", all_paths);
             self.dupe_files
                 .fetch_add((all_paths.len() - 1) as u64, Ordering::Relaxed);
             self.dupe_sizes
