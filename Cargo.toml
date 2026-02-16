@@ -1,7 +1,7 @@
 [package]
 name = "rdupes"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/erikreed/rdupes"
 license = "MIT"
 description = "A rust port of pydupes. Super fast."

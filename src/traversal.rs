@@ -96,7 +96,7 @@ pub async fn traverse_paths(
         info!("Files size-filtered: {}", n_filtered);
         info!("Hardlinks discovered/skipped: {}", n_hardlinks);
         info!("Unique sizes captured: {}", size_map.len());
-        let largest = size_map.iter().max_by_key(|(&k, v)| k * v.len() as u64);
+        let largest = size_map.iter().max_by_key(|&(&k, ref v)| k * v.len() as u64);
         if let Some(largest) = largest {
             info!(
                 "Largest candidate set: {} files with total size {}",
